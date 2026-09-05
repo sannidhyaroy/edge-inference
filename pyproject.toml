@@ -1,0 +1,69 @@
+[project]
+name = "edge-inference"
+version = "0.1.0"
+description = "Early-exit and INT8 quantization profiling for edge inference"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "numpy>=2.5.2",
+    "pandas>=3.0.5",
+    "rich>=15.0.0",
+    "torch>=2.14.0",
+    "torchvision>=0.29.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.16.6",
+]
+
+# On Linux the default PyPI `torch` wheel bundles roughly 2.5 GB of CUDA
+# libraries. This project measures CPU inference by design, so torch resolves
+# from PyTorch's CPU index instead, cutting the install to ~350 MB.
+#
+# The marker limits the redirect to Linux: macOS wheels on PyPI are already
+# CPU/MPS builds with no CUDA payload, so redirecting them would gain nothing
+# and only risk resolution failures on ARM.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+# target-version is inferred from requires-python above; setting it here too
+# would only create a second place to forget to update.
+
+[tool.ruff.lint]
+select = [
+    "F",   # pyflakes: undefined names, unused imports, genuine errors
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "I",   # isort: import ordering
+    "UP",  # pyupgrade: modern syntax for the pinned interpreter
+    "B",   # bugbear: mutable default args, loop variable capture, silent bugs
+    "C4",  # unnecessary comprehensions and generator wrapping
+    "SIM", # simplifiable conditionals and context managers
+    "RET", # return-statement hygiene
+    "PTH", # prefer pathlib over os.path
+    "NPY", # numpy legacy API, notably global RandomState seeding
+    "RUF", # ruff-specific correctness checks
+]
+ignore = [
+    # Line length is enforced by the formatter, which reflows code but
+    # deliberately leaves comments and strings alone. Keeping E501 on would
+    # flag exactly the lines the formatter refuses to fix.
+    "E501",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["edge_inference"]
+
+[tool.ruff.format]
+docstring-code-format = true
