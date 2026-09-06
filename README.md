@@ -58,11 +58,25 @@ rather than pulling in a CUDA stack this project never executes.
 ## Setup
 
 ```bash
-uv sync
+uv sync --extra cpu
 ```
 
 This creates the virtual environment and installs the exact dependency versions
 recorded in `uv.lock`.
+
+The extra is required, not optional. `torch` and `torchvision` sit in two
+mutually exclusive extras because the correct build depends on the machine and
+no environment marker can express "has a usable GPU":
+
+| extra | build | use on |
+| --- | --- | --- |
+| `cpu` | CPU-only, ~350 MB | measurement machines, where all reported latency comes from |
+| `cuda` | CUDA, ~2.5 GB | a training box with an NVIDIA GPU |
+
+One lockfile holds both resolutions, so nothing diverges between machines.
+Training may run wherever is fastest, but **every latency number in the results
+comes from a CPU machine**, and each result row records the CPU and thread
+count it was measured under.
 
 ## Status
 
