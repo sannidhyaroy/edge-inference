@@ -23,6 +23,7 @@ from edge_inference.config import (
     seed_everything,
 )
 from edge_inference.data import build_dataloader, load_split
+from edge_inference.export import DEFAULT_OPSET, export_onnx, verify_parity
 from edge_inference.models import SUPPORTED_BACKBONES, build_backbone
 from edge_inference.profiling import profile_model
 from edge_inference.training import fine_tune
@@ -153,6 +154,74 @@ def cmd_train(args: argparse.Namespace) -> int:
             f"  (epoch {int(best['epoch'])} peaked higher at "
             f"{best['val_accuracy'] * 100:.2f}%, neither saved nor reported)"
         )
+    return 0
+
+
+def load_checkpoint(model: torch.nn.Module, path: Path | None) -> torch.nn.Module:
+    """Load weights into `model` if a checkpoint exists, warning loudly if not."""
+    if path is None:
+        return model
+    if path.exists():
+        model.load_state_dict(torch.load(path, map_location="cpu"))
+        console.print(f"Loaded weights from [bold]{path}[/bold]")
+    else:
+        console.print(f"[yellow]No checkpoint at {path}, using untrained weights.[/yellow]")
+    return model
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    """Export a trained model to ONNX and verify it matches PyTorch."""
+    seed_everything()
+
+    model = build_backbone(args.backbone, num_classes=NUM_CLASSES)
+    load_checkpoint(model, Path(args.checkpoint) if args.checkpoint else None)
+
+    out = Path(args.out)
+    export_onnx(model, out, image_size=args.image_size, opset=args.opset)
+    size_mib = out.stat().st_size / (1024 * 1024)
+    console.print(f"Exported to [bold]{out}[/bold] ({size_mib:.2f} MiB, opset {args.opset})")
+
+    row = verify_parity(
+        model, out, image_size=args.image_size, samples=args.samples, atol=args.atol
+    )
+
+    table = Table(title="PyTorch against ONNX Runtime")
+    table.add_column("check")
+    table.add_column("value", justify="right")
+    table.add_row("samples", str(int(row["samples"])))
+    table.add_row("max absolute error", f"{row['max_abs_error']:.3e}")
+    table.add_row("mean absolute error", f"{row['mean_abs_error']:.3e}")
+    table.add_row("tolerance", f"{row['tolerance']:.0e}")
+    table.add_row("prediction agreement", f"{row['prediction_agreement'] * 100:.1f}%")
+    console.print(table)
+
+    row["backbone"] = args.backbone
+    row["opset"] = args.opset
+    row["onnx_mib"] = size_mib
+
+    results = Path(args.results)
+    results.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([row]).to_csv(results, index=False)
+    console.print(f"Wrote [bold]{results}[/bold]")
+
+    # A failed parity check is an error, not a warning. Every latency and
+    # accuracy number measured through this file afterwards would describe a
+    # model that was never evaluated.
+    if not row["predictions_match"]:
+        console.print(
+            "[bold red]Parity failed:[/bold red] the exported graph predicts a "
+            "different class from PyTorch on at least one input. Do not measure "
+            "against this file."
+        )
+        return 1
+
+    if not row["within_tolerance"]:
+        console.print(
+            f"[bold yellow]Note:[/bold yellow] max error {row['max_abs_error']:.3e} "
+            f"exceeds the {row['tolerance']:.0e} tolerance, but every prediction "
+            "still agrees. Worth understanding before relying on it."
+        )
+
     return 0
 
 
@@ -299,6 +368,22 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--out", default=str(CHECKPOINT_DIR / "resnet18_imagenette.pt"))
     train.add_argument("--history", default=str(RESULTS_DIR / "training_history.csv"))
     train.set_defaults(func=cmd_train)
+
+    export = subparsers.add_parser("export", help="export to ONNX and verify against PyTorch")
+    export.add_argument("--backbone", default="resnet18", choices=SUPPORTED_BACKBONES)
+    export.add_argument("--checkpoint", default=str(CHECKPOINT_DIR / "resnet18_imagenette.pt"))
+    export.add_argument("--out", default=str(CHECKPOINT_DIR / "resnet18_imagenette.onnx"))
+    export.add_argument("--image-size", type=int, default=IMAGE_SIZE)
+    export.add_argument("--opset", type=int, default=DEFAULT_OPSET, help="ONNX opset version")
+    export.add_argument("--samples", type=int, default=8, help="inputs compared for parity")
+    export.add_argument(
+        "--atol",
+        type=float,
+        default=1e-4,
+        help="absolute tolerance on raw outputs; predictions must match regardless",
+    )
+    export.add_argument("--results", default=str(RESULTS_DIR / "onnx_parity.csv"))
+    export.set_defaults(func=cmd_export)
 
     profile = subparsers.add_parser("profile", help="report parameters, operations, and size")
     profile.add_argument("--backbone", default="resnet18", choices=SUPPORTED_BACKBONES)
