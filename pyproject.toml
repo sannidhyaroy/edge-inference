@@ -12,11 +12,21 @@ dependencies = [
     "torchvision>=0.29.0",
 ]
 
+[project.scripts]
+edge = "edge_inference.cli:main"
+
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
     "ruff>=0.16.6",
 ]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/edge_inference"]
 
 # On Linux the default PyPI `torch` wheel bundles roughly 2.5 GB of CUDA
 # libraries. This project measures CPU inference by design, so torch resolves
