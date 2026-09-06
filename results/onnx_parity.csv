@@ -1,0 +1,2 @@
+samples,max_abs_error,mean_abs_error,prediction_agreement,tolerance,within_tolerance,predictions_match,backbone,opset,onnx_mib
+8,3.4831464290618896e-06,7.764901965856552e-07,1.0,0.0001,True,True,resnet18,18,42.72797870635986
