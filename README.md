@@ -17,6 +17,7 @@ imposes.
   - [Measure latency](#measure-latency)
   - [Fine-tune the backbone](#fine-tune-the-backbone)
   - [Profile the model](#profile-the-model)
+  - [Export to ONNX](#export-to-onnx)
 - [Training on a GPU machine](#training-on-a-gpu-machine)
   - [Getting a Colab runtime](#getting-a-colab-runtime)
   - [On the runtime](#on-the-runtime)
@@ -278,6 +279,50 @@ latency table does not.
 > A multiply and an accumulate are one MAC but two FLOPs, and papers disagree
 > about which they quote. Both are reported so a factor of two cannot silently
 > change a comparison.
+
+### Export to ONNX
+
+```bash
+uv run edge export
+```
+
+Writes `checkpoints/resnet18_imagenette.onnx` and checks it against PyTorch:
+
+```
+┏━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━┓
+┃ check                ┃     value ┃
+┡━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━┩
+│ samples              │         8 │
+│ max absolute error   │ 3.483e-06 │
+│ mean absolute error  │ 7.765e-07 │
+│ tolerance            │     1e-04 │
+│ prediction agreement │    100.0% │
+└──────────────────────┴───────────┘
+```
+
+ONNX is an interchange format: a frozen description of a network's operations
+and weights, independent of the framework that trained it. ONNX Runtime is the
+engine used here, because it is the deployment path on both x86 and ARM and
+because its static quantization tooling is what the next stage needs. Measuring
+PyTorch latency and then quantizing with a different stack would compare two
+different things.
+
+Export is not lossless, which is why it is checked rather than trusted. The
+exporter records the operations one run performs, so anything conditional can
+be baked in silently, and operator implementations differ between engines.
+
+Two comparisons are made, and the second decides the outcome. Raw outputs are
+compared numerically, which catches an operator exported with different
+semantics. Exact equality is not expected, since the engines use different
+kernels and accumulation orders. Then the predicted classes are compared, which
+is what actually determines accuracy: a large numerical difference that never
+flips a prediction is a curiosity, a small one that does is a bug.
+
+> [!IMPORTANT]
+> A prediction disagreement exits non-zero. If the exported graph and PyTorch
+> disagree about any class, every latency and accuracy number measured through
+> that file afterwards would describe a model nobody evaluated. Do not proceed
+> past a failed parity check.
 
 ---
 ## Training on a GPU machine
@@ -573,6 +618,7 @@ OMP_NUM_THREADS=2 uv run edge bench --threads 2
 | Purpose | Library |
 |---|---|
 | Model definitions and training | `torch`, `torchvision` |
+| Export and deployment runtime | `onnx`, `onnxruntime`, `onnxscript` |
 | Results handling | `pandas` |
 | Terminal output | `rich` |
 | Linting and formatting | `ruff` |
