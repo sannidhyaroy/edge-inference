@@ -24,6 +24,7 @@ from edge_inference.config import (
 )
 from edge_inference.data import build_dataloader, load_split
 from edge_inference.models import SUPPORTED_BACKBONES, build_backbone
+from edge_inference.profiling import profile_model
 from edge_inference.training import fine_tune
 
 console = Console()
@@ -138,6 +139,41 @@ def cmd_train(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_profile(args: argparse.Namespace) -> int:
+    """Report parameters, operations, and checkpoint size for a model."""
+    seed_everything()
+
+    model = build_backbone(args.backbone, num_classes=NUM_CLASSES)
+
+    checkpoint = Path(args.checkpoint) if args.checkpoint else None
+    if checkpoint is not None and checkpoint.exists():
+        model.load_state_dict(torch.load(checkpoint, map_location="cpu"))
+        console.print(f"Loaded weights from [bold]{checkpoint}[/bold]")
+    elif checkpoint is not None:
+        console.print(
+            f"[yellow]No checkpoint at {checkpoint}, profiling untrained weights.[/yellow]"
+        )
+
+    row = profile_model(model, image_size=args.image_size, checkpoint=checkpoint)
+    row["backbone"] = args.backbone
+
+    table = Table(title=f"{args.backbone} cost at {args.image_size}px, batch 1")
+    table.add_column("measure")
+    table.add_column("value", justify="right")
+    table.add_row("parameters", f"{int(row['parameters_total']):,}")
+    table.add_row("MFLOPs", f"{row['mflops']:.1f}")
+    table.add_row("MMACs", f"{row['mmacs']:.1f}")
+    if "checkpoint_mib" in row:
+        table.add_row("checkpoint MiB", f"{row['checkpoint_mib']:.2f}")
+    console.print(table)
+
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([row]).to_csv(out, index=False)
+    console.print(f"Wrote [bold]{out}[/bold]")
+    return 0
+
+
 def cmd_bench(args: argparse.Namespace) -> int:
     """Sweep thread counts and record forward pass latency for each."""
     seed_everything()
@@ -246,6 +282,17 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--out", default=str(CHECKPOINT_DIR / "resnet18_imagenette.pt"))
     train.add_argument("--history", default=str(RESULTS_DIR / "training_history.csv"))
     train.set_defaults(func=cmd_train)
+
+    profile = subparsers.add_parser("profile", help="report parameters, operations, and size")
+    profile.add_argument("--backbone", default="resnet18", choices=SUPPORTED_BACKBONES)
+    profile.add_argument("--image-size", type=int, default=IMAGE_SIZE)
+    profile.add_argument(
+        "--checkpoint",
+        default=str(CHECKPOINT_DIR / "resnet18_imagenette.pt"),
+        help="weights to load and measure on disk; operations do not depend on them",
+    )
+    profile.add_argument("--out", default=str(RESULTS_DIR / "model_cost.csv"))
+    profile.set_defaults(func=cmd_profile)
 
     bench = subparsers.add_parser("bench", help="measure forward pass latency")
     bench.add_argument("--backbone", default="resnet18", choices=SUPPORTED_BACKBONES)
