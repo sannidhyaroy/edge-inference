@@ -1,0 +1,68 @@
+# Git hooks, run through prek (https://github.com/j178/prek).
+#
+#   uv sync --extra cpu      installs prek along with everything else
+#   uv run prek install      once per clone, writes .git/hooks/
+#
+# prek is a dev dependency rather than a globally installed tool, so its version
+# is pinned in uv.lock like every other tool here and a collaborator needs no
+# separate install step.
+#
+# Hooks live in .git/, which is never cloned, so this file alone enforces
+# nothing until someone runs `prek install`. Continuous integration is what
+# makes these rules binding; the hooks just catch mistakes in a couple of
+# seconds instead of after a push.
+#
+# Two hook styles appear below, deliberately.
+#
+# ruff and pytest are declared `repo: local` with `language: system`, so prek
+# runs them exactly as written and installs nothing. Both are already dev
+# dependencies, so uv.lock stays the single place their versions are pinned.
+# Pointing at a remote hook repository instead would download a second copy of
+# ruff and pin its version a second time, and those two pins drift.
+#
+# conventional-pre-commit comes from a remote repository, because it is a
+# checker rather than something this project depends on. Adding a commit
+# message linter to pyproject.toml would be odd, and pinning it by `rev` here
+# is exactly what that style is for.
+
+default_install_hook_types:
+  - pre-commit
+  - commit-msg
+
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format
+        language: system
+        types_or: [python, pyi]
+
+      # --fix rewrites files. prek notices the change, aborts the commit, and
+      # asks you to review and stage the result rather than quietly amending
+      # what you were committing.
+      - id: ruff-check
+        name: ruff check
+        entry: uv run ruff check --fix
+        language: system
+        types_or: [python, pyi]
+
+      # pass_filenames is off because pytest takes test selectors, not a list of
+      # changed files. Restricting types keeps it off doc-only commits, where it
+      # would cost seconds and prove nothing.
+      - id: pytest
+        name: pytest
+        entry: uv run pytest -q
+        language: system
+        types_or: [python, pyi]
+        pass_filenames: false
+
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v4.4.0
+    hooks:
+      # --force-scope requires the type to carry a scope, so `feat: add x` is
+      # rejected in favour of `feat(bench): add x`. Drop the argument if a
+      # repository-wide change ever has no sensible scope to name.
+      - id: conventional-pre-commit
+        stages: [commit-msg]
+        args: [--force-scope]
