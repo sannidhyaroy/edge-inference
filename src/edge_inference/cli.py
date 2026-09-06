@@ -131,11 +131,28 @@ def cmd_train(args: argparse.Namespace) -> int:
     frame.to_csv(history_path, index=False)
     console.print(f"Wrote [bold]{history_path}[/bold]")
 
+    # Report the final epoch, because that is the model just written to disk.
+    # Quoting the best epoch instead would describe weights that were never
+    # saved, and every downstream measurement would be against a different
+    # model than the headline number.
+    #
+    # The best epoch is deliberately not saved either. Imagenette ships only
+    # train and val splits, so val doubles as the test set. Keeping whichever
+    # epoch scored highest on it would mean choosing a model using the same
+    # data the accuracy is reported on, and the maximum of several noisy
+    # measurements is biased upward. A fixed epoch budget with the last epoch
+    # reported makes no such choice.
+    final = history[-1]
     best = max(history, key=lambda row: row["val_accuracy"])
     console.print(
-        f"Best validation accuracy: [bold]{best['val_accuracy'] * 100:.2f}%[/bold] "
-        f"at epoch {int(best['epoch'])}"
+        f"Final validation accuracy: [bold]{final['val_accuracy'] * 100:.2f}%[/bold] "
+        f"after {int(final['epoch'])} epoch(s), which is what was saved"
     )
+    if best["epoch"] != final["epoch"]:
+        console.print(
+            f"  (epoch {int(best['epoch'])} peaked higher at "
+            f"{best['val_accuracy'] * 100:.2f}%, neither saved nor reported)"
+        )
     return 0
 
 
