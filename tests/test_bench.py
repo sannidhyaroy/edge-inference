@@ -49,5 +49,21 @@ def test_summary_statistics_are_ordered():
 def test_machine_info_is_populated():
     info = machine_info()
 
-    for key in ("hostname", "system", "arch", "cpu", "torch_version"):
+    for key in ("machine", "cpu", "system", "arch", "torch_version"):
         assert info[key], f"{key} should not be empty"
+
+    # Logical cores are always knowable. Physical cores are best effort per
+    # platform, so only their type is asserted, not their presence.
+    assert isinstance(info["cores_logical"], int)
+    assert info["cores_logical"] >= 1
+    assert info["cores_physical"] is None or isinstance(info["cores_physical"], int)
+
+
+def test_machine_info_excludes_hostname():
+    """Results files are committed to a public repo, so no personal identifiers."""
+    import platform
+
+    info = machine_info()
+
+    assert "hostname" not in info
+    assert platform.node() not in info.values()

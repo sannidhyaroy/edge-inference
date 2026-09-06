@@ -19,10 +19,14 @@ is fixed in one place rather than reinvented per experiment:
   laptop stand in for a constrained device, and it makes it impossible to
   compare two results from different thread budgets by accident.
 
-* **The CPU and host are recorded too.** Latency is a property of the model and
-  the hardware together, so a row without its hardware is not interpretable.
+* **The hardware is recorded too.** Latency is a property of the model and the
+  machine together, so a row without its hardware is not interpretable. Rows
+  carry the machine model, CPU, and physical and logical core counts, which is
+  what a results table or plot legend needs. The hostname is deliberately left
+  out: it identifies the operator rather than the hardware.
 """
 
+import os
 import platform
 import subprocess
 import time
@@ -35,39 +39,145 @@ import torch
 from edge_inference.config import IMAGE_SIZE, SEED
 
 
+def _sysctl(key: str) -> str | None:
+    """Read one macOS sysctl value, or None if it is unavailable."""
+    try:
+        result = subprocess.run(
+            ["sysctl", "-n", key],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except OSError, subprocess.SubprocessError:
+        return None
+    return result.stdout.strip() or None
+
+
+def _powershell(expression: str) -> str | None:
+    """Evaluate one PowerShell expression on Windows, or None if unavailable.
+
+    Windows exposes no /proc or sysctl, so hardware details come from CIM. This
+    is the same best-effort shape as the macOS sysctl path: never raise, just
+    report nothing when the information cannot be had.
+    """
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", expression],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except OSError, subprocess.SubprocessError:
+        return None
+    return result.stdout.strip() or None
+
+
+def _proc_field(path: Path, prefix: str, separator: str = ":") -> str | None:
+    """Return the value of the first line in `path` starting with `prefix`."""
+    if not path.exists():
+        return None
+    for line in path.read_text().splitlines():
+        if line.startswith(prefix):
+            return line.split(separator, 1)[1].strip()
+    return None
+
+
 def cpu_model() -> str:
     """Return a human readable CPU name, best effort, on any platform."""
     system = platform.system()
     if system == "Linux":
-        cpuinfo = Path("/proc/cpuinfo")
-        if cpuinfo.exists():
-            for line in cpuinfo.read_text().splitlines():
-                if line.startswith("model name"):
-                    return line.split(":", 1)[1].strip()
+        name = _proc_field(Path("/proc/cpuinfo"), "model name")
+        if name:
+            return name
     elif system == "Darwin":
-        try:
-            result = subprocess.run(
-                ["sysctl", "-n", "machdep.cpu.brand_string"],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-        except OSError, subprocess.SubprocessError:
-            pass
-        else:
-            return result.stdout.strip()
+        name = _sysctl("machdep.cpu.brand_string")
+        if name:
+            return name
     # platform.processor() is descriptive on Windows and vague elsewhere, so
     # fall back to the architecture string rather than returning nothing.
     return platform.processor() or platform.machine()
 
 
-def machine_info() -> dict[str, str]:
-    """Describe the machine well enough to interpret a latency row later."""
+def machine_model() -> str:
+    """Return the hardware model, for labelling result tables and plots.
+
+    A hostname identifies a machine but describes nothing. "HP ProBook 445 G10"
+    tells a reader what produced a number, which is what a chart legend or a
+    results table actually needs.
+    """
+    system = platform.system()
+    if system == "Linux":
+        # DMI is the firmware's own description of the machine, exposed by the
+        # kernel. Some systems report placeholders here, hence the filter.
+        product = Path("/sys/devices/virtual/dmi/id/product_name")
+        if product.exists():
+            name = product.read_text().strip()
+            if name and "unknown" not in name.lower() and "o.e.m." not in name.lower():
+                return name
+    elif system == "Darwin":
+        # Returns an identifier such as MacBookPro17,1 rather than a marketing
+        # name, which is still far more useful than a hostname.
+        model = _sysctl("hw.model")
+        if model:
+            return model
+    elif system == "Windows":
+        model = _powershell("(Get-CimInstance Win32_ComputerSystem).Model")
+        if model:
+            return model
+    return platform.machine()
+
+
+def physical_cores() -> int | None:
+    """Count physical cores, which is not the same as logical threads.
+
+    The distinction is central to these measurements: on a chip with SMT, the
+    logical count is double the physical one, and oversubscribing past the
+    physical cores changes latency behaviour markedly.
+    """
+    system = platform.system()
+    if system == "Linux":
+        cpuinfo = Path("/proc/cpuinfo")
+        if cpuinfo.exists():
+            # A core is identified by (socket, core) together, since core ids
+            # restart from zero on each socket.
+            cores: set[tuple[str, str]] = set()
+            socket_id: str | None = None
+            for line in cpuinfo.read_text().splitlines():
+                if line.startswith("physical id"):
+                    socket_id = line.split(":", 1)[1].strip()
+                elif line.startswith("core id") and socket_id is not None:
+                    cores.add((socket_id, line.split(":", 1)[1].strip()))
+            if cores:
+                return len(cores)
+    elif system == "Darwin":
+        value = _sysctl("hw.physicalcpu")
+        if value and value.isdigit():
+            return int(value)
+    elif system == "Windows":
+        # Sums across sockets, so it stays correct on a multi-socket machine.
+        value = _powershell(
+            "(Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfCores -Sum).Sum"
+        )
+        if value and value.isdigit():
+            return int(value)
+    return None
+
+
+def machine_info() -> dict[str, object]:
+    """Describe the machine well enough to interpret a latency row later.
+
+    `machine` is the field to label plots and result tables with: it says what
+    produced a number, which a hostname does not. The hostname is deliberately
+    not recorded, since the model, CPU, and platform already identify a machine
+    and it would only add a personal detail to a public results file.
+    """
     return {
-        "hostname": platform.node(),
+        "machine": machine_model(),
+        "cpu": cpu_model(),
+        "cores_physical": physical_cores(),
+        "cores_logical": os.cpu_count(),
         "system": platform.system(),
         "arch": platform.machine(),
-        "cpu": cpu_model(),
         "python_version": platform.python_version(),
         "torch_version": torch.__version__,
     }
