@@ -94,12 +94,129 @@ uv run edge bench --threads 1,2,4,6,12 --runs 50 --warmup 10
 ```
 
 Results are written to `results/latency_backbone.csv`, one row per thread
-count, each recording the CPU, host, and effective thread count alongside the
-timings. `uv run edge bench --help` lists the remaining options.
+count, each recording the machine, CPU, core counts, and effective thread
+count alongside the timings. `uv run edge bench --help` lists the remaining
+options.
 
 The model is left randomly initialised here on purpose. Latency depends on
 tensor shapes rather than weight values, so this measures the architecture
 without downloading pretrained weights or requiring a trained checkpoint.
+
+Fine-tune the backbone on Imagenette, writing weights to `checkpoints/` and
+per-epoch metrics to `results/training_history.csv`:
+
+```bash
+uv run edge train --epochs 3 --batch-size 32
+```
+
+Report parameters, operations, and checkpoint size for a trained model:
+
+```bash
+uv run edge profile
+```
+
+## Training on a GPU machine
+
+Training is the one part of this project that does not have to happen on the
+measurement machine, because weights are identical wherever they are computed.
+Only latency is hardware-specific.
+
+The difference is large enough to matter. Measured at 35 images per second on
+the reference laptop CPU, one epoch over Imagenette's 9469 training images
+takes about 4.5 minutes, so three epochs with validation runs roughly 18
+minutes. The same three epochs on a free Colab T4 took 85 seconds, about 30
+seconds per epoch, reaching 96.20% validation accuracy.
+
+### Getting a Colab runtime
+
+[Google Colab](https://colab.research.google.com) offers a free T4. The
+official CLI can create a runtime and open a shell on it, which is preferable
+to working in notebook cells: the repo is used as it actually is, and nothing
+depends on hidden cell state.
+
+Once, on the local machine:
+
+```bash
+uv tool install git+https://github.com/googlecolab/google-colab-cli.git@v0.7.0
+```
+
+Install from the tag rather than from PyPI. `colab ssh` landed in v0.7.0, and
+the released package may still be older.
+
+An SSH key is required, and it must not be group or world readable:
+
+```bash
+ssh-keygen -t ed25519 -f ~/.ssh/colab
+chmod 600 ~/.ssh/colab
+```
+
+Then create, connect to, and eventually stop a runtime:
+
+```bash
+colab new -s edge --gpu T4
+colab ssh -s edge -i ~/.ssh/colab
+colab stop -s edge
+```
+
+The session name is arbitrary. With only one session running, `-s` can be
+omitted. **Stop the runtime when finished**, since it consumes quota while it
+is alive.
+
+### On the runtime
+
+```bash
+# The GPU driver libraries are not on the loader path in an SSH shell.
+export LD_LIBRARY_PATH=/usr/lib64-nvidia:$LD_LIBRARY_PATH
+
+curl -LsSf https://astral.sh/uv/0.12.1/install.sh | sh
+
+git clone https://github.com/sannidhyaroy/edge-inference.git
+cd edge-inference
+
+uv sync --extra cuda
+uv run edge data prepare
+uv run edge train --device cuda --epochs 8 --batch-size 64 --num-workers 2
+```
+
+That first line is not optional and the failure it prevents is confusing.
+Without it, `nvidia-smi` reports a missing `libnvidia-ml.so`, torch reports no
+CUDA device, and the install looks wrong even though every CUDA package is
+present. The GPU is passed through correctly, and `/dev/nvidia0` exists, but
+the driver libraries live in `/usr/lib64-nvidia`, which `ldconfig` does not
+index. A Colab notebook kernel gets that directory injected into its
+environment; a shell opened over SSH does not.
+
+Point it at `/usr/lib64-nvidia` specifically. There is also a
+`/usr/local/cuda-*/compat/` directory holding an older driver shim, and using
+that one produces a version mismatch rather than a clean failure.
+
+Pin the uv version in that URL to whatever `uv --version` reports on the
+machine the lockfile was generated on. Installing it takes about a second.
+
+Three things about that sequence:
+
+- **`--extra cuda` is required.** A bare `uv sync` installs neither torch
+  build, and `--extra cpu` would install a CPU-only torch and leave the GPU
+  idle while training silently runs at laptop speed.
+- **The interpreter needs no separate step.** Colab ships an older Python, but
+  `.python-version` is committed and uv downloads a matching interpreter on
+  its own during `uv sync`.
+- **A larger batch pays off on a GPU** and does not on a CPU, so 64 rather than
+  32. Data loading workers are a different matter: a free Colab runtime has
+  only two vCPUs, so asking for more than two makes them contend rather than
+  help. The scarce resource on that machine is the CPU, not the accelerator.
+
+`--device cuda` fails loudly if torch reports no CUDA device rather than
+falling back to CPU, because a silent fallback would still finish, just far
+slower, with nothing explaining why.
+
+Training writes `checkpoints/resnet18_imagenette.pt` (about 43 MB) and
+`results/training_history.csv`. Copy both back with `colab download` before
+stopping the runtime, since Colab runtimes are ephemeral and everything
+downstream is measured locally.
+
+Verified on a Tesla T4: torch 2.14 resolves to a CUDA 13 build whose
+architecture list includes `sm_75`, which is what a T4 needs.
 
 ## Results so far
 
@@ -134,5 +251,5 @@ than merely disappointing.
 
 ## Status
 
-Setup, data loading, and the latency harness are in place. Baseline training,
-quantization, and the early-exit models follow.
+Setup, data loading, the latency harness, fine-tuning, and cost profiling are
+in place. ONNX export, quantization, and the early-exit models follow.
