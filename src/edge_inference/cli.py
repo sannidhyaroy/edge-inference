@@ -9,18 +9,22 @@ import os
 from pathlib import Path
 
 import pandas as pd
+import torch
 from rich.console import Console
 from rich.table import Table
 
-from edge_inference.bench import benchmark_model
+from edge_inference.bench import benchmark_model, resolve_device
 from edge_inference.config import (
+    CHECKPOINT_DIR,
     DATA_DIR,
     IMAGE_SIZE,
+    NUM_CLASSES,
     RESULTS_DIR,
     seed_everything,
 )
-from edge_inference.data import load_split
+from edge_inference.data import build_dataloader, load_split
 from edge_inference.models import SUPPORTED_BACKBONES, build_backbone
+from edge_inference.training import fine_tune
 
 console = Console()
 
@@ -68,6 +72,69 @@ def cmd_data_prepare(args: argparse.Namespace) -> int:
     console.print(table)
 
     console.print(f"On disk: [bold]{directory_size_mb(root):.1f} MiB[/bold]")
+    return 0
+
+
+def cmd_train(args: argparse.Namespace) -> int:
+    """Fine-tune a pretrained backbone on Imagenette and save the weights."""
+    seed_everything()
+    device = resolve_device(args.device)
+
+    train_dataset = load_split("train", root=Path(args.root))
+    val_dataset = load_split("val", root=Path(args.root))
+
+    train_loader = build_dataloader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+    )
+    val_loader = build_dataloader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+    )
+
+    model = build_backbone(args.backbone, num_classes=NUM_CLASSES, pretrained=True)
+
+    console.print(
+        f"Fine-tuning [bold]{args.backbone}[/bold] on {len(train_dataset)} images, "
+        f"validating on {len(val_dataset)}, for {args.epochs} epoch(s) on {device}"
+    )
+
+    history = fine_tune(
+        model,
+        train_loader,
+        val_loader,
+        device=device,
+        epochs=args.epochs,
+        learning_rate=args.lr,
+    )
+
+    checkpoint = Path(args.out)
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    # Only the weights are saved, not the whole model object. A state dict is a
+    # plain mapping of tensors, so it loads without needing the original class
+    # definition to be importable and survives refactoring of the code.
+    torch.save(model.state_dict(), checkpoint)
+    console.print(f"Saved weights to [bold]{checkpoint}[/bold]")
+
+    frame = pd.DataFrame(history)
+    frame["backbone"] = args.backbone
+    frame["device"] = device
+    frame["batch_size"] = args.batch_size
+
+    history_path = Path(args.history)
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(history_path, index=False)
+    console.print(f"Wrote [bold]{history_path}[/bold]")
+
+    best = max(history, key=lambda row: row["val_accuracy"])
+    console.print(
+        f"Best validation accuracy: [bold]{best['val_accuracy'] * 100:.2f}%[/bold] "
+        f"at epoch {int(best['epoch'])}"
+    )
     return 0
 
 
@@ -156,6 +223,30 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--root", default=str(DATA_DIR), help="dataset directory")
     prepare.set_defaults(func=cmd_data_prepare)
 
+    train = subparsers.add_parser("train", help="fine-tune a backbone on Imagenette")
+    train.add_argument("--backbone", default="resnet18", choices=SUPPORTED_BACKBONES)
+    train.add_argument("--root", default=str(DATA_DIR), help="dataset directory")
+    train.add_argument("--epochs", type=int, default=3)
+    train.add_argument("--batch-size", type=int, default=32)
+    train.add_argument("--lr", type=float, default=0.01, help="initial learning rate")
+    train.add_argument(
+        "--device",
+        default="cpu",
+        help="cpu, cuda, or mps. Training may run anywhere; latency measurement may not",
+    )
+    train.add_argument(
+        "--num-workers",
+        type=int,
+        default=2,
+        help=(
+            "background data loading processes. On CPU these compete with the "
+            "compute threads, so more is not always better"
+        ),
+    )
+    train.add_argument("--out", default=str(CHECKPOINT_DIR / "resnet18_imagenette.pt"))
+    train.add_argument("--history", default=str(RESULTS_DIR / "training_history.csv"))
+    train.set_defaults(func=cmd_train)
+
     bench = subparsers.add_parser("bench", help="measure forward pass latency")
     bench.add_argument("--backbone", default="resnet18", choices=SUPPORTED_BACKBONES)
     bench.add_argument("--num-classes", type=int, default=None, help="replace the classifier head")
@@ -185,7 +276,9 @@ def main(argv: list[str] | None = None) -> int:
     return args.func(args)
 
 
-# Guarded so that dataloader worker processes, which start by re-importing the
-# entry module on Windows and macOS, do not re-run the command.
+# Guarded so that dataloader worker processes do not re-run the command. Those
+# workers re-import the entry module on every platform now: spawn on Windows and
+# macOS, and forkserver on Linux since Python 3.14. Without this guard they
+# recurse and die with a BrokenPipeError.
 if __name__ == "__main__":
     raise SystemExit(main())

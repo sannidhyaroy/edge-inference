@@ -100,11 +100,18 @@ def build_dataloader(
 ) -> DataLoader:
     """Wrap a dataset in a loader with reproducible shuffling.
 
-    `num_workers` above zero loads images in background processes. On Windows
-    and macOS those processes are started by spawning a fresh interpreter that
-    re-imports the entry module, so any caller must be guarded by
-    `if __name__ == "__main__":` or the import will recurse. The CLI is written
-    that way for exactly this reason.
+    `num_workers` above zero loads images in background processes, and how
+    those processes start matters. Windows and macOS have always used `spawn`,
+    which launches a fresh interpreter that re-imports the entry module. As of
+    Python 3.14 Linux defaults to `forkserver` rather than `fork`, which
+    re-imports as well, because forking a process that already has threads is
+    unsafe.
+
+    The practical consequence is that **every** platform now re-imports the
+    entry module in its workers, so any caller must be guarded by
+    `if __name__ == "__main__":` or the import recurses and the workers die
+    with a BrokenPipeError. The CLI is written that way for exactly this
+    reason.
     """
     generator = torch.Generator().manual_seed(SEED)
     return DataLoader(

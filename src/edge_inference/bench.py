@@ -201,6 +201,24 @@ def set_thread_count(threads: int) -> int:
     return torch.get_num_threads()
 
 
+def resolve_device(name: str) -> str:
+    """Validate a device string, failing loudly rather than silently downgrading.
+
+    A silent fallback to CPU would be the worst outcome here: training would
+    still finish, just far slower, and nothing would say why. Equally, a
+    benchmark that quietly ran on a GPU would produce numbers that look like
+    edge latency and are not.
+    """
+    if name == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            "cuda requested but torch reports no CUDA device. On a GPU machine, "
+            "check the environment was installed with `uv sync --extra cuda`."
+        )
+    if name == "mps" and not torch.backends.mps.is_available():
+        raise RuntimeError("mps requested but this build of torch has no MPS backend")
+    return name
+
+
 def synchronize(device: str) -> None:
     """Block until queued work on `device` has actually finished.
 
