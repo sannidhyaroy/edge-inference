@@ -21,16 +21,18 @@ that failure loud rather than silent.
 from pathlib import Path
 
 import numpy as np
+import onnx
 import onnxruntime as ort
 import torch
 from torch import nn
 
 from edge_inference.config import IMAGE_SIZE, SEED
 
-# Opset 17 is old enough to be supported everywhere that matters and new enough
-# for the quantization tooling. Pinning it keeps an exported graph reproducible
-# rather than dependent on whatever the installed torch defaults to.
-DEFAULT_OPSET = 17
+# What torch's dynamo exporter emits natively for these models. Requesting an
+# older opset makes it export at 18 and then down-convert, which fails for this
+# graph and silently leaves the file at 18 anyway. Better to name the version
+# actually produced and verify it than to request one and be quietly ignored.
+DEFAULT_OPSET = 18
 
 INPUT_NAME = "input"
 OUTPUT_NAME = "logits"
@@ -48,6 +50,13 @@ def export_onnx(
     The batch dimension is marked dynamic. Inference here is always batch size
     one, but calibrating a quantized model feeds batches through the same file,
     and a graph frozen at batch one would reject them.
+
+    Weights are written into the file rather than beside it. torch defaults to
+    external data, which splits a model into a small graph plus a `.onnx.data`
+    blob. That is necessary past protobuf's 2 GB ceiling and a liability below
+    it: the size measured on disk becomes the graph alone, which would turn the
+    quantization size comparison into nonsense. These models are tens of
+    megabytes, so a single self-contained file is both simpler and honest.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     model = model.to("cpu").eval()
@@ -60,10 +69,36 @@ def export_onnx(
         str(path),
         input_names=[INPUT_NAME],
         output_names=[OUTPUT_NAME],
-        dynamic_axes={INPUT_NAME: {0: "batch"}, OUTPUT_NAME: {0: "batch"}},
+        # `dynamic_shapes` rather than the older `dynamic_axes`, which is
+        # deprecated. Dim.DYNAMIC lets the exporter infer the bounds instead of
+        # a named Dim, which historically defaults to a minimum of 2 and would
+        # reject the batch size of one every measurement here uses.
+        dynamic_shapes=({0: torch.export.Dim.DYNAMIC},),
         opset_version=opset,
+        external_data=False,
     )
+
+    # Read the opset back rather than trusting the request. Asking for a
+    # version the exporter cannot down-convert to leaves the file at whatever
+    # it produced, with the failure buried in the log, and every later claim
+    # about the graph's version would be wrong.
+    actual = exported_opset(path)
+    if actual != opset:
+        raise RuntimeError(
+            f"requested opset {opset} but the exported graph is opset {actual}. "
+            "The exporter emits its native version and down-converts afterwards, "
+            "and that conversion can fail without raising."
+        )
     return path
+
+
+def exported_opset(path: Path) -> int:
+    """Return the default-domain opset version recorded in an ONNX file."""
+    model = onnx.load(str(path), load_external_data=False)
+    for entry in model.opset_import:
+        if entry.domain in ("", "ai.onnx"):
+            return entry.version
+    raise ValueError(f"{path} declares no default-domain opset")
 
 
 def build_session(path: Path, *, threads: int = 1) -> ort.InferenceSession:

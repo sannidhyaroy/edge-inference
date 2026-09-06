@@ -8,6 +8,7 @@ dependencies = [
     "numpy>=2.5.2",
     "onnx>=1.22.0",
     "onnxruntime>=1.29.0",
+    "onnxscript>=0.7.1",
     "pandas>=3.0.5",
     "rich>=15.0.0",
 ]
