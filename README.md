@@ -310,10 +310,10 @@ cell state.
   uv tool install git+https://github.com/googlecolab/google-colab-cli.git@v0.7.0
   ```
 
-  > [!IMPORTANT]
-  > Install from the git tag, not from PyPI. `colab ssh` was added in **v0.7.0**,
-  > and `uv tool install google-colab-cli` still resolves to v0.6.0, which has no
-  > `ssh` subcommand at all. A later tag is fine, an earlier one is not.
+> [!IMPORTANT]
+> Install from the git tag, not from PyPI. `colab ssh` was added in **v0.7.0**,
+> and `uv tool install google-colab-cli` still resolves to v0.6.0, which has no
+> `ssh` subcommand at all. A later tag is fine, an earlier one is not.
 
 - Create an SSH key if you do not have one. It must not be group or world
   readable, or SSH refuses to use it:
@@ -339,10 +339,10 @@ cell state.
   colab stop -s edge
   ```
 
-  > [!CAUTION]
-  > A runtime consumes quota while alive, and its filesystem is **ephemeral**.
-  > Anything not copied off is gone when it stops. Copy your results back before
-  > running this.
+> [!CAUTION]
+> A runtime consumes quota while alive, and its filesystem is **ephemeral**.
+> Anything not copied off is gone when it stops. Copy your results back before
+> running this.
 
 ### On the runtime
 
@@ -374,14 +374,14 @@ cell state.
   uv sync --extra cuda
   ```
 
-  > [!IMPORTANT]
-  > `--extra cuda`, not `--extra cpu` and not a bare `uv sync`. A bare sync
-  > installs neither torch build, and `--extra cpu` installs a CPU-only torch
-  > that leaves the T4 idle while training runs at laptop speed with no error to
-  > tell you.
-
   You do not need to install Python separately. Colab ships an older interpreter,
   but `.python-version` is committed and uv fetches 3.14 during the sync.
+
+> [!IMPORTANT]
+> `--extra cuda`, not `--extra cpu` and not a bare `uv sync`. A bare sync
+> installs neither torch build, and `--extra cpu` installs a CPU-only torch that
+> leaves the T4 idle while training runs at laptop speed, with no error to tell
+> you.
 
 - Download the dataset and train:
 
@@ -393,8 +393,8 @@ cell state.
   Expected output ends with something like:
 
   ```
-    epoch 8/8: train loss 0.1500, val loss 0.0982, val accuracy 96.94%
-  Final validation accuracy: 96.94% after 8 epoch(s), which is what was saved
+    epoch 8/8: train loss 0.1453, val loss 0.1000, val accuracy 96.89%
+  Final validation accuracy: 96.89% after 8 epoch(s), which is what was saved
   ```
 
 > [!NOTE]
@@ -457,10 +457,24 @@ mechanism is unexplained and is recorded here as measured.
 
 ### Baseline accuracy
 
-ResNet-18 fine-tuned for 8 epochs on a T4, reaching **96.94%** validation
-accuracy. The curve was flat by epoch 7, so this is a converged baseline rather
-than an undertrained one, which matters because a quantization accuracy drop
-measured against an undertrained model would be confounded by training noise.
+ResNet-18 fine-tuned for 8 epochs on a T4, reaching **96.89%** validation
+accuracy. Per-epoch metrics are in `results/training_history.csv`.
+
+The curve had flattened by epoch 7, gaining 0.05 points over the last epoch
+against 3 points over the first three. That matters because a converged
+baseline is what quantization gets compared against later. An accuracy drop
+measured against an undertrained model would be confounded by training that had
+simply not finished.
+
+> [!NOTE]
+> A fixed seed here means a reproducible starting point, not identical output.
+> An earlier run of the same command with the same seed reached 96.94%. GPU
+> arithmetic is not bit-deterministic by default: cuDNN selects convolution
+> algorithms by runtime heuristic, and some backward passes accumulate with
+> atomics whose order varies. Changing `--num-workers` also reseeds the data
+> loading processes, so the random crops and flips differ. Runs land within
+> roughly a tenth of a point of each other, and results quote the run that
+> produced the checkpoint on disk.
 
 ---
 ## Troubleshooting
