@@ -139,6 +139,11 @@ def fine_tune(
 
     with Progress(*columns, console=console) as progress:
         for epoch in range(1, epochs + 1):
+            # Read the rate before stepping the scheduler, so the recorded
+            # value is the one this epoch actually trained at rather than the
+            # one the next epoch will use.
+            epoch_learning_rate = optimizer.param_groups[0]["lr"]
+
             train_metrics = run_epoch(
                 model,
                 train_loader,
@@ -163,7 +168,7 @@ def fine_tune(
 
             row = {
                 "epoch": epoch,
-                "learning_rate": optimizer.param_groups[0]["lr"],
+                "learning_rate": epoch_learning_rate,
                 "train_loss": train_metrics["loss"],
                 "train_accuracy": train_metrics["accuracy"],
                 "val_loss": val_metrics["loss"],
