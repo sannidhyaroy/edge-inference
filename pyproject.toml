@@ -36,6 +36,9 @@ cuda = [
 edge = "edge_inference.cli:main"
 
 [dependency-groups]
+app = [
+    "gradio>=6.26.0",
+]
 dev = [
     "prek>=0.5.2",
     "pytest>=9.1.1",
