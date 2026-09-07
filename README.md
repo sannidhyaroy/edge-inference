@@ -18,6 +18,7 @@ imposes.
   - [Fine-tune the backbone](#fine-tune-the-backbone)
   - [Profile the model](#profile-the-model)
   - [Export to ONNX](#export-to-onnx)
+  - [Quantize to INT8](#quantize-to-int8)
 - [Training on a GPU machine](#training-on-a-gpu-machine)
   - [Getting a Colab runtime](#getting-a-colab-runtime)
   - [On the runtime](#on-the-runtime)
@@ -324,6 +325,40 @@ flips a prediction is a curiosity, a small one that does is a bug.
 > that file afterwards would describe a model nobody evaluated. Do not proceed
 > past a failed parity check.
 
+### Quantize to INT8
+
+```bash
+uv run edge quantize
+```
+
+Calibrates, quantizes, then evaluates and times both models through the same
+code paths, writing `results/quantization.csv`.
+
+Quantization stores weights and activations as 8-bit integers instead of
+32-bit floats. Three things follow, and only two are guaranteed:
+
+- **The file shrinks about fourfold.** A property of the format, true anywhere.
+- **Accuracy changes slightly**, because 256 integer levels cannot represent
+  every float exactly. Also a property of the model, true anywhere.
+- **Speed may or may not improve.** Entirely dependent on whether the CPU has
+  instructions for 8-bit dot products.
+
+*Post-training* means quantizing a model that has finished training, with no
+retraining. *Static* means the value ranges are measured in advance from real
+data rather than recomputed on every inference, which is what a deployed vision
+model wants: the cost is paid once, offline.
+
+**Calibration** is that measurement. A few hundred images are pushed through
+the float model while the tooling records the range of values at each layer,
+and those ranges decide how the float span maps onto 256 integer levels.
+
+> [!NOTE]
+> Calibration uses training images with **evaluation** preprocessing, not the
+> augmented pipeline. It measures the range of values inference will actually
+> see, and random crops would measure a distribution that never occurs at
+> inference time. Calibrating on unrepresentative data produces an accuracy
+> drop that looks like a quantization problem but is really a data problem.
+
 ---
 ## Training on a GPU machine
 
@@ -520,6 +555,49 @@ simply not finished.
 > loading processes, so the random crops and flips differ. Runs land within
 > roughly a tenth of a point of each other, and results quote the run that
 > produced the checkpoint on disk.
+
+### INT8 quantization
+
+Both models evaluated on all 3925 validation images and timed at 6 threads
+through ONNX Runtime, using the same code paths so the comparison describes the
+models rather than two harnesses:
+
+| precision | accuracy | size MiB | median ms | p95 ms |
+| --- | ---: | ---: | ---: | ---: |
+| float32 | 96.89% | 42.73 | 6.46 | 7.10 |
+| int8 | 96.41% | 10.83 | 3.88 | 4.43 |
+
+**0.48 points of accuracy, 3.95x smaller, 1.67x faster.**
+
+The size reduction is essentially the theoretical 4x from 32-bit to 8-bit, and
+along with the accuracy drop it is hardware-independent: both would hold
+identically on a phone or a single-board computer.
+
+The speedup is not, and it came out **higher than expected**. This CPU has AVX2
+but no VNNI, the instruction that performs an 8-bit dot product in one step, so
+the prediction was 1.0 to 1.3x. Moving a quarter as much data through cache
+turned out to matter more than the missing instruction. Which is the argument
+for measuring rather than reasoning from a datasheet.
+
+### The runtime mattered more than the optimization
+
+Worth putting beside the numbers above. The same float32 model, same 6 threads,
+same 160px input:
+
+| runtime | median ms |
+| --- | ---: |
+| PyTorch eager | 24.07 |
+| ONNX Runtime | 6.46 |
+| ONNX Runtime, INT8 | 3.88 |
+
+**Changing the runtime alone was a 3.7x speedup**, more than twice what
+quantization then added on top. PyTorch dispatches operations one at a time
+through a Python-facing interpreter; ONNX Runtime compiles the graph ahead of
+time, fuses operations, and plans memory once.
+
+For an edge deployment this says something the accuracy tables do not: choosing
+the execution runtime can outweigh the model optimization technique applied to
+it. Both are worth doing, but they are not the same size of lever.
 
 ---
 ## Troubleshooting
