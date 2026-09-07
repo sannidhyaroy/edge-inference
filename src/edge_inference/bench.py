@@ -261,6 +261,49 @@ def summarise(times_ms: Sequence[float]) -> dict[str, float]:
     }
 
 
+def benchmark_session(
+    session,
+    *,
+    threads: int,
+    warmup: int,
+    runs: int,
+    batch_size: int = 1,
+    image_size: int = IMAGE_SIZE,
+) -> dict[str, object]:
+    """Time an ONNX Runtime session using the same protocol as the torch path.
+
+    Deliberately mirrors `benchmark_model`: same warmup, same statistics, same
+    fixed input. A float32 model measured one way and a quantized model
+    measured another would produce a speedup figure that describes the two
+    harnesses rather than the two models.
+
+    The session's own thread count is set when it is built, since ONNX Runtime
+    fixes it at session creation rather than per call. It is recorded here so
+    the row carries the setting it was measured under.
+    """
+    generator = torch.Generator().manual_seed(SEED)
+    inputs = torch.randn(batch_size, 3, image_size, image_size, generator=generator).numpy()
+    input_name = session.get_inputs()[0].name
+
+    def run_once() -> None:
+        session.run(None, {input_name: inputs})
+
+    times_ms = time_callable(run_once, warmup=warmup, runs=runs)
+
+    return {
+        **machine_info(),
+        "device": "cpu",
+        "runtime": "onnxruntime",
+        "threads_requested": threads,
+        "threads_effective": threads,
+        "batch_size": batch_size,
+        "image_size": image_size,
+        "warmup": warmup,
+        "runs": runs,
+        **summarise(times_ms),
+    }
+
+
 def benchmark_model(
     model: torch.nn.Module,
     *,

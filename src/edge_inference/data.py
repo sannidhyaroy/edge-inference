@@ -61,14 +61,27 @@ def build_transforms(*, train: bool) -> v2.Compose:
     )
 
 
-def load_split(split: str, *, root: Path = DATA_DIR, download: bool = False) -> Imagenette:
+def load_split(
+    split: str,
+    *,
+    root: Path = DATA_DIR,
+    download: bool = False,
+    augment: bool | None = None,
+) -> Imagenette:
     """Load one Imagenette split, downloading it first if asked.
 
     `split` is "train" or "val". The validation split is used as the test set
     throughout, since Imagenette ships only these two.
+
+    `augment` defaults to augmenting the training split and not the validation
+    one, which is what training wants. It is overridable because quantization
+    calibration needs training *images* with evaluation *preprocessing*:
+    calibration measures the range of values flowing through the network, and
+    those ranges have to match what inference will actually see. Random crops
+    would measure a distribution that never occurs at inference time.
     """
     root.mkdir(parents=True, exist_ok=True)
-    transform = build_transforms(train=split == "train")
+    transform = build_transforms(train=split == "train" if augment is None else augment)
 
     try:
         return Imagenette(

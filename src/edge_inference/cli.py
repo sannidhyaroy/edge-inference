@@ -13,7 +13,7 @@ import torch
 from rich.console import Console
 from rich.table import Table
 
-from edge_inference.bench import benchmark_model, resolve_device
+from edge_inference.bench import benchmark_model, benchmark_session, resolve_device
 from edge_inference.config import (
     CHECKPOINT_DIR,
     DATA_DIR,
@@ -23,9 +23,16 @@ from edge_inference.config import (
     seed_everything,
 )
 from edge_inference.data import build_dataloader, load_split
-from edge_inference.export import DEFAULT_OPSET, export_onnx, verify_parity
+from edge_inference.export import (
+    DEFAULT_OPSET,
+    build_session,
+    evaluate_session,
+    export_onnx,
+    verify_parity,
+)
 from edge_inference.models import SUPPORTED_BACKBONES, build_backbone
 from edge_inference.profiling import profile_model
+from edge_inference.quantization import DataLoaderCalibrationReader, quantize_onnx
 from edge_inference.training import fine_tune
 
 console = Console()
@@ -225,6 +232,94 @@ def cmd_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_quantize(args: argparse.Namespace) -> int:
+    """Quantize an exported model to INT8 and measure what it cost."""
+    seed_everything()
+
+    source = Path(args.source)
+    if not source.exists():
+        console.print(f"[bold red]No ONNX model at {source}.[/bold red] Run `edge export` first.")
+        return 1
+
+    # Training images with evaluation preprocessing. Calibration measures the
+    # range of values inference will actually see, and random crops would
+    # measure a distribution that never occurs at inference time.
+    calibration_dataset = load_split("train", root=Path(args.root), augment=False)
+    calibration_loader = build_dataloader(
+        calibration_dataset, batch_size=args.batch_size, shuffle=True
+    )
+    reader = DataLoaderCalibrationReader(calibration_loader, limit=args.calibration_images)
+
+    console.print(
+        f"Calibrating on [bold]{args.calibration_images}[/bold] training images, "
+        f"then quantizing to INT8"
+    )
+    destination = Path(args.out)
+    quantize_onnx(source, destination, reader, per_channel=not args.per_tensor)
+
+    val_dataset = load_split("val", root=Path(args.root))
+    val_loader = build_dataloader(val_dataset, batch_size=args.batch_size, shuffle=False)
+
+    rows = []
+    for label, path in (("float32", source), ("int8", destination)):
+        size_mib = path.stat().st_size / (1024 * 1024)
+        session = build_session(path, threads=args.threads)
+        console.print(f"Evaluating {label} on {len(val_dataset)} images")
+        metrics = evaluate_session(session, val_loader)
+
+        timed = benchmark_session(
+            session,
+            threads=args.threads,
+            warmup=args.warmup,
+            runs=args.runs,
+            image_size=args.image_size,
+        )
+        rows.append(
+            {
+                "precision": label,
+                "accuracy": metrics["accuracy"],
+                "size_mib": size_mib,
+                **timed,
+            }
+        )
+
+    float_row, int8_row = rows
+    accuracy_drop = (float_row["accuracy"] - int8_row["accuracy"]) * 100
+    size_ratio = float_row["size_mib"] / int8_row["size_mib"]
+    speedup = float_row["median_ms"] / int8_row["median_ms"]
+
+    table = Table(title=f"float32 against INT8, {args.threads} thread(s)")
+    for column in ("precision", "accuracy", "size MiB", "median ms", "p95 ms"):
+        table.add_column(column, justify="right")
+    for row in rows:
+        table.add_row(
+            row["precision"],
+            f"{row['accuracy'] * 100:.2f}%",
+            f"{row['size_mib']:.2f}",
+            f"{row['median_ms']:.2f}",
+            f"{row['p95_ms']:.2f}",
+        )
+    console.print(table)
+
+    console.print(
+        f"Accuracy drop [bold]{accuracy_drop:+.2f}[/bold] points, "
+        f"size [bold]{size_ratio:.2f}x[/bold] smaller, "
+        f"latency [bold]{speedup:.2f}x[/bold]"
+    )
+    if speedup < 1.2:
+        console.print(
+            "[yellow]Modest speedup is expected on a CPU without VNNI.[/yellow] "
+            "The size and accuracy results are hardware-independent and still hold."
+        )
+
+    frame = pd.DataFrame(rows)
+    out = Path(args.results)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(out, index=False)
+    console.print(f"Wrote [bold]{out}[/bold]")
+    return 0
+
+
 def cmd_profile(args: argparse.Namespace) -> int:
     """Report parameters, operations, and checkpoint size for a model."""
     seed_everything()
@@ -384,6 +479,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     export.add_argument("--results", default=str(RESULTS_DIR / "onnx_parity.csv"))
     export.set_defaults(func=cmd_export)
+
+    quantize = subparsers.add_parser(
+        "quantize", help="quantize to INT8 and compare against float32"
+    )
+    quantize.add_argument("--root", default=str(DATA_DIR), help="dataset directory")
+    quantize.add_argument("--source", default=str(CHECKPOINT_DIR / "resnet18_imagenette.onnx"))
+    quantize.add_argument("--out", default=str(CHECKPOINT_DIR / "resnet18_imagenette.int8.onnx"))
+    quantize.add_argument(
+        "--calibration-images",
+        type=int,
+        default=256,
+        help="training images used to measure activation ranges",
+    )
+    quantize.add_argument(
+        "--per-tensor",
+        action="store_true",
+        help="one scale per layer instead of per convolution filter, usually less accurate",
+    )
+    quantize.add_argument("--batch-size", type=int, default=32)
+    quantize.add_argument("--image-size", type=int, default=IMAGE_SIZE)
+    quantize.add_argument("--threads", type=int, default=6, help="threads for both timed models")
+    quantize.add_argument("--runs", type=int, default=50)
+    quantize.add_argument("--warmup", type=int, default=10)
+    quantize.add_argument("--results", default=str(RESULTS_DIR / "quantization.csv"))
+    quantize.set_defaults(func=cmd_quantize)
 
     profile = subparsers.add_parser("profile", help="report parameters, operations, and size")
     profile.add_argument("--backbone", default="resnet18", choices=SUPPORTED_BACKBONES)

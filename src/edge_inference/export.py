@@ -123,6 +123,24 @@ def build_session(path: Path, *, threads: int = 1) -> ort.InferenceSession:
     )
 
 
+def evaluate_session(session: ort.InferenceSession, loader) -> dict[str, float]:
+    """Measure top-1 accuracy of an ONNX model over a dataloader.
+
+    Float32 and quantized models are evaluated through this same function, so a
+    reported accuracy drop is a difference between the models rather than a
+    difference between two evaluation paths.
+    """
+    correct = 0
+    seen = 0
+
+    for images, targets in loader:
+        outputs = session.run(None, {INPUT_NAME: images.numpy()})[0]
+        correct += int((outputs.argmax(axis=1) == targets.numpy()).sum())
+        seen += int(targets.shape[0])
+
+    return {"accuracy": correct / seen, "images": seen}
+
+
 def verify_parity(
     model: nn.Module,
     path: Path,
