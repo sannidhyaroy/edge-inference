@@ -1,0 +1,2 @@
+parameters_total,parameters_trainable,flops,mflops,macs,mmacs,image_size,batch_size,checkpoint_bytes,checkpoint_mib,backbone
+11181642,11181642,1850583040.0,1850.58304,925291520.0,925.29152,160,1,44807307,42.73157787322998,resnet18
