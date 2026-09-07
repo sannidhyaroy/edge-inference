@@ -24,6 +24,7 @@ which shows up as an accuracy drop that looks like a quantization problem but
 is really a data problem.
 """
 
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -87,18 +88,30 @@ def quantize_onnx(
     path without any error saying so.
     """
     destination.parent.mkdir(parents=True, exist_ok=True)
-    prepared = destination.with_name(f"{destination.stem}.prepared.onnx")
 
-    quant_pre_process(str(source), str(prepared), skip_symbolic_shape=False)
+    # The intermediate model goes in a temporary directory rather than beside
+    # the output. quant_pre_process may write its weights as a separate
+    # external-data file with a generated name, in whatever directory it is
+    # working in, and deleting only the .onnx leaves a 43 MB orphan behind on
+    # every run. A temporary directory takes both away.
+    with tempfile.TemporaryDirectory(prefix="edge-quant-") as workspace:
+        prepared = Path(workspace) / "prepared.onnx"
 
-    quantize_static(
-        str(prepared),
-        str(destination),
-        calibration,
-        per_channel=per_channel,
-        weight_type=QuantType.QInt8,
-        activation_type=QuantType.QUInt8,
-    )
+        # Symbolic shape inference is skipped. It tries to reason about the
+        # dynamic batch axis algebraically and raises "Incomplete symbolic
+        # shape inference" on graphs from torch's dynamo exporter. The
+        # remaining steps, ordinary ONNX shape inference and graph
+        # optimisation, are what quantization actually needs, and the batch
+        # axis stays dynamic either way.
+        quant_pre_process(str(source), str(prepared), skip_symbolic_shape=True)
 
-    prepared.unlink(missing_ok=True)
+        quantize_static(
+            str(prepared),
+            str(destination),
+            calibration,
+            per_channel=per_channel,
+            weight_type=QuantType.QInt8,
+            activation_type=QuantType.QUInt8,
+        )
+
     return destination
