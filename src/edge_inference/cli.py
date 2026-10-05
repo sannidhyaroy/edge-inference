@@ -455,7 +455,12 @@ def cmd_exits_profile(args: argparse.Namespace) -> int:
 
     # The checkpoint name is part of the default, so profiling two differently
     # trained models never overwrites one with the other.
-    default_name = f"exit_profile_{checkpoint.stem}_pytorch_float32_t{args.threads}.csv"
+    #
+    # Gzipped because profiles are measurements, not derived files: a re-run
+    # measures a different moment rather than reproducing this one, so they
+    # are committed rather than regenerated. Compression cuts them about 5x,
+    # and pandas reads .csv.gz directly.
+    default_name = f"exit_profile_{checkpoint.stem}_pytorch_float32_t{args.threads}.csv.gz"
     out = Path(args.out or RESULTS_DIR / default_name)
     out.parent.mkdir(parents=True, exist_ok=True)
     frame.to_csv(out, index=False)
@@ -502,7 +507,8 @@ def cmd_exits_sweep(args: argparse.Namespace) -> int:
 
     # Outputs are named after the profile they came from, so sweeps of
     # different models and configurations sit side by side.
-    stem = profile.stem.removeprefix("exit_profile_")
+    # Strip `.csv` as well as `.gz`, since Path.stem removes only the last suffix.
+    stem = profile.name.removesuffix(".gz").removesuffix(".csv").removeprefix("exit_profile_")
     vectors_out = profile.with_name(f"exit_vectors_{stem}.csv")
     sweep_out = profile.with_name(f"exit_sweep_{stem}.csv")
     vectors.to_csv(vectors_out, index=False)
