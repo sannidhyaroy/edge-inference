@@ -452,7 +452,10 @@ def cmd_exits_profile(args: argparse.Namespace) -> int:
         )
     console.print(table)
 
-    out = Path(args.out or RESULTS_DIR / f"exit_profile_pytorch_float32_t{args.threads}.csv")
+    # The checkpoint name is part of the default, so profiling two differently
+    # trained models never overwrites one with the other.
+    default_name = f"exit_profile_{checkpoint.stem}_pytorch_float32_t{args.threads}.csv"
+    out = Path(args.out or RESULTS_DIR / default_name)
     out.parent.mkdir(parents=True, exist_ok=True)
     frame.to_csv(out, index=False)
     console.print(f"Wrote [bold]{out}[/bold] ({len(frame)} rows)")

@@ -399,7 +399,7 @@ uv run edge exits profile --threads 2
 Runs each validation image through the early-exit model one stage at a time,
 recording at every exit the cumulative latency, the top probability, entropy,
 the prediction and whether it was correct. One row per image per exit, written
-to `results/exit_profile_pytorch_float32_t2.csv`.
+to `results/exit_profile_<checkpoint>_pytorch_float32_t2.csv`.
 
 Every exit is always reached, so the table records what each exit would answer.
 Any confidence threshold, or any other stopping rule, can then be applied
