@@ -86,9 +86,17 @@ escape hatch.
 Three findings bear on where this technique belongs.
 
 **Six threads beat twelve**, and the reason was tail latency rather than the
-median. Early exit is a tail-latency technique too: it does not make the hard
-cases faster, it stops easy cases from paying for them. Both matter in the same
-deployments and for the same reason.
+median. That makes the next finding matter: **confidence-based early exit cuts
+the mean far more than the tail.** On our equal-weights model, stopping at the
+first exit with top probability 0.55 or more cuts mean latency 23%, from 15.65
+to 12.00 ms, but p95 only from 17.54 to 16.50 ms. While a sizeable share of
+images still runs to the final exit, those runs keep setting the tail.
+
+Under a hard deadline it is the tail that decides whether a task completes, so
+letting each image choose its own exit does little for deadlines on its own.
+Capping latency needs the exit chosen from the time remaining, which is what a
+state-driven controller such as Angelucci et al.'s does: it forces an earlier
+exit when the budget demands it, whatever the image's confidence.
 
 **The runtime mattered more than the optimization.** Moving from PyTorch to
 ONNX Runtime was a 3.16x speedup; INT8 quantization then added 1.76x. Before
