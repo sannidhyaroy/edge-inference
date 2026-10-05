@@ -21,6 +21,8 @@ imposes.
     - [Profile the model](#profile-the-model)
     - [Export to ONNX](#export-to-onnx)
     - [Quantize to INT8](#quantize-to-int8)
+    - [Train with early exits](#train-with-early-exits)
+    - [Profile every exit](#profile-every-exit)
 - [Training on a GPU machine](#training-on-a-gpu-machine)
     - [Getting a Colab runtime](#getting-a-colab-runtime)
     - [On the runtime](#on-the-runtime)
@@ -112,10 +114,14 @@ edge-inference/
 │   ├── cli.py              argparse entry point, exposed as the `edge` command
 │   ├── config.py           paths, seed, dataset constants
 │   ├── data.py             Imagenette loading and preprocessing
-│   ├── models.py           backbone construction
-│   ├── profiling.py        parameters, operations, checkpoint size
-│   └── training.py         fine-tuning and evaluation
-├── tests/                  sanity checks for the measurement harness
+│   ├── exit_profiler.py    per-image latency and confidence at every exit
+│   ├── export.py           ONNX export and parity checking
+│   ├── models.py           backbone construction, early-exit wrapper
+│   ├── profiling.py        parameters, operations, cost per exit, size
+│   ├── quantization.py     static INT8 quantization and calibration
+│   └── training.py         fine-tuning and evaluation, single or multi-exit
+├── app/main.py             browser demo comparing float32 and INT8
+├── tests/                  sanity checks
 ├── papers/                 citations and licenses for the reference papers
 ├── results/                committed CSVs and plots
 ├── data/                   Imagenette, gitignored
@@ -366,6 +372,47 @@ and those ranges decide how the float span maps onto 256 integer levels.
 > see, and random crops would measure a distribution that never occurs at
 > inference time. Calibrating on unrepresentative data produces an accuracy
 > drop that looks like a quantization problem but is really a data problem.
+
+### Train with early exits
+
+```bash
+uv run edge train --early-exit --epochs 8
+```
+
+Attaches classifier heads after `layer2` and `layer3` and trains all three
+exits at once, with the loss a weighted average of each exit's cross-entropy.
+Checkpoint and history go to `*_early_exit*` paths, so this never overwrites
+the plain model it is compared against. Like the plain model, it is far faster
+on a GPU: see [Training on a GPU machine](#training-on-a-gpu-machine).
+
+The exits share the whole network body, so with equal weights the weak early
+heads pull it toward themselves and the final exit ends up worse than a plain
+model's. `--exit-weights` sets each exit's share of the loss, shallowest first.
+`--exit-weights 0.3,0.3,1` favours the final exit, at the early exits' expense.
+
+### Profile every exit
+
+```bash
+uv run edge exits profile --threads 2
+```
+
+Runs each validation image through the early-exit model one stage at a time,
+recording at every exit the cumulative latency, the top probability, entropy,
+the prediction and whether it was correct. One row per image per exit, written
+to `results/exit_profile_pytorch_float32_t2.csv`.
+
+Every exit is always reached, so the table records what each exit would answer.
+Any confidence threshold, or any other stopping rule, can then be applied
+afterwards from the same measurements instead of being fixed before measuring.
+
+`--limit N` profiles a seeded random sample of N images. It does not take the
+first N: image folders are sorted by class, so the first few hundred validation
+images are all one class.
+
+> [!NOTE]
+> Latency here is measured in PyTorch, which runs this model about 3.7x slower
+> than ONNX Runtime. Confidence and correctness are unaffected, but treat the
+> timings as relative until the ONNX Runtime path lands.
 
 ---
 
