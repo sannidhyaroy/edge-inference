@@ -23,6 +23,7 @@ from edge_inference.config import (
     seed_everything,
 )
 from edge_inference.data import build_dataloader, load_split
+from edge_inference.exit_profiler import profile_exits
 from edge_inference.export import (
     DEFAULT_OPSET,
     build_session,
@@ -36,7 +37,7 @@ from edge_inference.models import (
     build_backbone,
     build_early_exit,
 )
-from edge_inference.profiling import profile_model
+from edge_inference.profiling import operations_per_exit, profile_model
 from edge_inference.quantization import DataLoaderCalibrationReader, quantize_onnx
 from edge_inference.training import fine_tune
 
@@ -397,6 +398,67 @@ def cmd_profile(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_exits_profile(args: argparse.Namespace) -> int:
+    """Record latency, confidence and correctness per image at every exit."""
+    seed_everything()
+
+    model = build_early_exit(args.backbone, num_classes=NUM_CLASSES)
+    checkpoint = Path(args.checkpoint)
+    if not checkpoint.exists():
+        console.print(
+            f"[bold red]No checkpoint at {checkpoint}.[/bold red] "
+            "Train one with `edge train --early-exit` first. Untrained exits would "
+            "report confidences that mean nothing."
+        )
+        return 1
+    load_checkpoint(model, checkpoint)
+
+    dataset = load_split("val", root=Path(args.root))
+    macs = operations_per_exit(model, image_size=IMAGE_SIZE)
+    count = len(dataset) if args.limit is None else min(args.limit, len(dataset))
+
+    console.print(
+        f"Profiling {count} images at every exit, {args.threads} thread(s), "
+        f"after {args.warmup} warmup runs"
+    )
+    rows = profile_exits(
+        model,
+        dataset,
+        threads=args.threads,
+        warmup=args.warmup,
+        macs_per_exit=macs,
+        limit=args.limit,
+    )
+    frame = pd.DataFrame(rows)
+
+    summary = frame.groupby("exit_name", sort=False).agg(
+        mmacs=("mmacs", "first"),
+        accuracy=("correct", "mean"),
+        median_ms=("cumulative_ms", "median"),
+        p95_ms=("cumulative_ms", lambda s: s.quantile(0.95)),
+        mean_confidence=("confidence", "mean"),
+    )
+    table = Table(title=f"Every exit, {count} images, {args.threads} thread(s)")
+    for column in ("exit", "MMAC", "accuracy", "median ms", "p95 ms", "mean confidence"):
+        table.add_column(column, justify="right")
+    for name, row in summary.iterrows():
+        table.add_row(
+            str(name),
+            f"{row['mmacs']:.1f}",
+            f"{row['accuracy'] * 100:.2f}%",
+            f"{row['median_ms']:.2f}",
+            f"{row['p95_ms']:.2f}",
+            f"{row['mean_confidence']:.3f}",
+        )
+    console.print(table)
+
+    out = Path(args.out or RESULTS_DIR / f"exit_profile_pytorch_float32_t{args.threads}.csv")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(out, index=False)
+    console.print(f"Wrote [bold]{out}[/bold] ({len(frame)} rows)")
+    return 0
+
+
 def cmd_bench(args: argparse.Namespace) -> int:
     """Sweep thread counts and record forward pass latency for each."""
     seed_everything()
@@ -572,6 +634,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     profile.add_argument("--out", default=str(RESULTS_DIR / "model_cost.csv"))
     profile.set_defaults(func=cmd_profile)
+
+    exits = subparsers.add_parser("exits", help="early-exit profiling and analysis")
+    exits_sub = exits.add_subparsers(dest="exits_command", required=True)
+    exits_profile = exits_sub.add_parser(
+        "profile", help="latency, confidence and correctness per image at every exit"
+    )
+    exits_profile.add_argument("--backbone", default="resnet18", choices=SUPPORTED_BACKBONES)
+    exits_profile.add_argument("--root", default=str(DATA_DIR), help="dataset directory")
+    exits_profile.add_argument(
+        "--checkpoint", default=str(CHECKPOINT_DIR / "resnet18_early_exit_imagenette.pt")
+    )
+    exits_profile.add_argument("--threads", type=int, default=2, help="pinned thread count")
+    exits_profile.add_argument("--warmup", type=int, default=10, help="discarded runs first")
+    exits_profile.add_argument(
+        "--limit", type=int, default=None, help="profile only the first N images"
+    )
+    exits_profile.add_argument(
+        "--out", default=None, help="default names the runtime, precision and thread count"
+    )
+    exits_profile.set_defaults(func=cmd_exits_profile)
 
     bench = subparsers.add_parser("bench", help="measure forward pass latency")
     bench.add_argument("--backbone", default="resnet18", choices=SUPPORTED_BACKBONES)
