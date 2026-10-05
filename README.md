@@ -256,8 +256,8 @@ Writes weights to `checkpoints/` and per-epoch metrics to
 `results/training_history.csv`.
 
 > [!CAUTION]
-> Eight epochs takes roughly **48 minutes** on a six-core laptop CPU, measured
-> at 35 images per second. If you have access to a GPU, see
+> Eight epochs takes roughly **33 minutes** on a six-core laptop CPU, measured
+> at 52 images per second. If you have access to a GPU, see
 > [Training on a GPU machine](#training-on-a-gpu-machine), where the same run
 > takes about 4 minutes.
 
@@ -412,7 +412,7 @@ first N: image folders are sorted by class, so the first few hundred validation
 images are all one class.
 
 > [!NOTE]
-> Latency here is measured in PyTorch, which runs this model about 3.7x slower
+> Latency here is measured in PyTorch, which runs this model about 3x slower
 > than ONNX Runtime. Confidence and correctness are unaffected, but treat the
 > timings as relative until the ONNX Runtime path lands.
 
@@ -428,10 +428,10 @@ The difference is large enough to matter:
 
 | Machine                | Per epoch        | Eight epochs     |
 | ---------------------- | ---------------- | ---------------- |
-| Ryzen 5 7530U, 6 cores | about 6 minutes  | about 48 minutes |
+| Ryzen 5 7530U, 6 cores | about 4 minutes  | about 33 minutes |
 | Free Colab T4          | about 30 seconds | about 4 minutes  |
 
-Per-epoch figures are measured: 35 images per second on the laptop CPU, and 85
+Per-epoch figures are measured: 52 images per second on the laptop CPU, and 85
 seconds for a three epoch run on the T4. The eight epoch totals follow from
 those rates and include validation.
 
@@ -560,27 +560,41 @@ the CPU.
 ### Latency
 
 ResNet-18 at 160px, batch size 1, on an HP ProBook 445 G10 (Ryzen 5 7530U, 6
-cores, 12 threads). 50 timed runs after 10 discarded warmup runs:
+cores, 12 threads), on AC power with the CPU free to boost to 4547 MHz. 50 timed
+runs after 10 discarded warmup runs:
 
 | threads | median ms | p95 ms | std ms |
 | ------: | --------: | -----: | -----: |
-|       1 |     55.39 |  56.55 |   0.70 |
-|       2 |     30.26 |  31.38 |   0.53 |
-|       4 |     38.90 |  40.93 |   0.94 |
-|       6 |     24.07 |  29.24 |   1.95 |
-|      12 |     25.34 |  40.63 |   6.44 |
+|       1 |     25.10 |  25.99 |   0.39 |
+|       2 |     14.54 |  15.62 |   0.51 |
+|       4 |     18.61 |  19.92 |   0.70 |
+|       6 |     13.73 |  15.19 |   0.76 |
+|      12 |     16.97 |  21.30 |   2.04 |
 
-**Six threads, one per physical core, is the best operating point.** Twelve
-oversubscribes those cores through SMT and buys nothing useful: the median
-barely moves while the spread roughly triples, pushing p95 from 29.2 to 40.6 ms.
-When two threads share a core they contend for the same vector units, which is
-essentially all a convolution does. For inference under a deadline, that loss of
-predictability matters more than the median does.
+**Beyond two threads, extra cores buy little.** Six threads beat two by only 6%.
+A likely reason is that with one or two cores busy the CPU boosts them higher
+than it can boost all six, which offsets most of the extra parallelism.
 
-**The four thread result is slower than two** and does not fit that pattern. It
-reproduces across separate sweeps and in an isolated process, so it is a genuine
-property of this CPU with this model rather than a measurement artefact. The
-mechanism is unexplained and is recorded here as measured.
+**Twelve threads is worse than six, most visibly in the tail.** It
+oversubscribes the six physical cores through SMT: the spread grows about 2.7x
+and p95 goes from 15.19 to 21.30 ms. When two threads share a core they contend
+for the same vector units, which is essentially all a convolution does. For
+inference under a deadline, that loss of predictability matters more than the
+median does.
+
+**The four thread result is slower than two** and does not fit either pattern.
+It has reproduced in every sweep, in an isolated process, at base clock, at full
+boost and on battery, so it is a genuine property of this CPU with this model
+rather than a measurement artefact. The mechanism is unexplained and is recorded
+here as measured.
+
+> [!IMPORTANT]
+> Latencies first recorded in September were re-measured in October. The
+> frequency manager in use in September held the CPU at its 2 GHz base clock,
+> and the same model ran about 2.2x slower at one and two threads. Accuracy,
+> size and operation counts were unaffected and reproduced exactly. Every
+> latency row now records its power source and CPU frequency policy, so a cap
+> like that shows up in the data instead of hiding in it.
 
 > [!NOTE]
 > These runs were taken on a machine under normal desktop load. A sweep taken
@@ -618,10 +632,10 @@ models rather than two harnesses:
 
 | precision | accuracy | size MiB | median ms | p95 ms |
 | --------- | -------: | -------: | --------: | -----: |
-| float32   |   96.89% |    42.73 |      6.46 |   7.10 |
-| int8      |   96.41% |    10.83 |      3.88 |   4.43 |
+| float32   |   96.89% |    42.73 |      4.34 |   4.46 |
+| int8      |   96.41% |    10.83 |      2.47 |   2.53 |
 
-**0.48 points of accuracy, 3.95x smaller, 1.67x faster.**
+**0.48 points of accuracy, 3.95x smaller, 1.76x faster.**
 
 The size reduction is essentially the theoretical 4x from 32-bit to 8-bit, and
 along with the accuracy drop it is hardware-independent: both would hold
@@ -640,11 +654,11 @@ same 160px input:
 
 | runtime            | median ms |
 | ------------------ | --------: |
-| PyTorch eager      |     24.07 |
-| ONNX Runtime       |      6.46 |
-| ONNX Runtime, INT8 |      3.88 |
+| PyTorch eager      |     13.73 |
+| ONNX Runtime       |      4.34 |
+| ONNX Runtime, INT8 |      2.47 |
 
-**Changing the runtime alone was a 3.7x speedup**, more than twice what
+**Changing the runtime alone was a 3.2x speedup**, nearly twice what
 quantization then added on top. PyTorch dispatches operations one at a time
 through a Python-facing interpreter; ONNX Runtime compiles the graph ahead of
 time, fuses operations, and plans memory once.

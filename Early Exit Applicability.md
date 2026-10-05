@@ -91,7 +91,7 @@ cases faster, it stops easy cases from paying for them. Both matter in the same
 deployments and for the same reason.
 
 **The runtime mattered more than the optimization.** Moving from PyTorch to
-ONNX Runtime was a 3.72x speedup; INT8 quantization then added 1.67x. Before
+ONNX Runtime was a 3.16x speedup; INT8 quantization then added 1.76x. Before
 reaching for early exit, it is worth asking whether the execution stack has
 been chosen at all. Early exit is a sophisticated lever, and sophisticated
 levers are worth pulling after the blunt ones.

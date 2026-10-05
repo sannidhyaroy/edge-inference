@@ -7,7 +7,16 @@ this file.
 **Setup.** ResNet-18 pretrained on ImageNet, fine-tuned on Imagenette, a
 10-class ImageNet subset, at 160px. Trained on a Tesla T4. Every latency figure
 measured on an HP ProBook 445 G10, Ryzen 5 7530U, 6 cores and 12 threads,
-batch size 1, after discarding warmup runs.
+batch size 1, after discarding warmup runs, on AC power with the CPU free to
+boost to 4547 MHz.
+
+> [!NOTE]
+> Latencies first recorded in September were re-measured in October and are
+> replaced here. The frequency manager in use in September held the CPU at its
+> 2 GHz base clock, and the same model at the same settings ran about 2.2x
+> slower at one and two threads. Accuracy, size and operation counts were
+> unaffected and reproduced exactly. Every latency row now records its power
+> source and CPU frequency policy, so a cap like that is visible in the data.
 
 ---
 
@@ -35,26 +44,30 @@ Latency never does.
 Forward pass latency, PyTorch, 50 timed runs after 10 discarded:
 
 | threads | median ms | p95 ms | std ms |
-| ---: | ---: | ---: | ---: |
-| 1 | 55.39 | 56.55 | 0.70 |
-| 2 | 30.26 | 31.38 | 0.53 |
-| 4 | 38.90 | 40.93 | 0.94 |
-| 6 | 24.07 | 29.24 | 1.95 |
-| 12 | 25.34 | 40.63 | 6.44 |
+| ------: | --------: | -----: | -----: |
+|       1 |     25.10 |  25.99 |   0.39 |
+|       2 |     14.54 |  15.62 |   0.51 |
+|       4 |     18.61 |  19.92 |   0.70 |
+|       6 |     13.73 |  15.19 |   0.76 |
+|      12 |     16.97 |  21.30 |   2.04 |
 
-**Six threads, one per physical core, is the best operating point.** Twelve
-oversubscribes those cores through SMT and gains nothing useful: the median
-barely moves while the spread roughly triples and p95 rises from 29.2 to
-40.6 ms. Two threads sharing a core contend for the same vector units, which is
-essentially all a convolution uses.
+**Beyond two threads, extra cores buy little.** Two threads already reach
+14.54 ms and six only improve that by 6%, to 13.73 ms. A likely reason is that
+with one or two cores busy the CPU boosts them higher than it can boost all
+six, which offsets most of the extra parallelism.
 
-For inference under a deadline the tail matters more than the median, so this
-conclusion only exists because p95 is reported.
+**Twelve threads is worse than six, and the tail shows it most.** It
+oversubscribes the six physical cores through SMT: the median rises to
+16.97 ms, the spread grows about 2.7x and p95 goes from 15.19 to 21.30 ms. Two
+threads sharing a core contend for the same vector units, which is essentially
+all a convolution uses. For inference under a deadline the tail matters more
+than the median, so this conclusion only exists because p95 is reported.
 
-**The four thread result is slower than two** and does not fit that pattern. It
-reproduces across separate sweeps and in an isolated process, so it is a
-genuine property of this CPU with this model rather than a measurement
-artefact. The mechanism is unexplained and recorded as measured.
+**The four thread result is slower than two** and does not fit either pattern.
+It has reproduced in every sweep, in an isolated process, at base clock, at
+full boost and on battery, so it is a genuine property of this CPU with this
+model rather than a measurement artefact. The mechanism is unexplained and
+recorded as measured.
 
 ---
 
@@ -65,11 +78,11 @@ training images. Both models evaluated on all 3925 validation images and timed
 at 6 threads through identical code paths.
 
 | precision | accuracy | size MiB | median ms | p95 ms |
-| --- | ---: | ---: | ---: | ---: |
-| float32 | 96.89% | 42.73 | 6.46 | 7.10 |
-| int8 | 96.41% | 10.83 | 3.88 | 4.43 |
+| --------- | -------: | -------: | --------: | -----: |
+| float32   |   96.89% |    42.73 |      4.34 |   4.46 |
+| int8      |   96.41% |    10.83 |      2.47 |   2.53 |
 
-**0.48 points of accuracy, 3.95x smaller, 1.67x faster.**
+**0.48 points of accuracy, 3.95x smaller, 1.76x faster.**
 
 The size reduction is essentially the theoretical 4x from 32-bit to 8-bit.
 Together with the accuracy drop it is hardware-independent, and both would hold
@@ -86,19 +99,19 @@ than the missing instruction did.
 
 Same float32 model, same 6 threads, same 160px input:
 
-| runtime | median ms | against PyTorch |
-| --- | ---: | ---: |
-| PyTorch eager | 24.07 | 1.00x |
-| ONNX Runtime | 6.46 | 3.72x |
-| ONNX Runtime, INT8 | 3.88 | 6.20x |
+| runtime            | median ms | against PyTorch |
+| ------------------ | --------: | --------------: |
+| PyTorch eager      |     13.73 |           1.00x |
+| ONNX Runtime       |      4.34 |           3.16x |
+| ONNX Runtime, INT8 |      2.47 |           5.56x |
 
-**Changing the execution runtime alone was a 3.72x speedup**, more than twice
-what quantization added on top of it. PyTorch dispatches operations one at a
+**Changing the execution runtime alone was a 3.16x speedup**, nearly twice what
+quantization added on top of it. PyTorch dispatches operations one at a
 time through a Python-facing interpreter, while ONNX Runtime compiles the graph
 ahead of time, fuses operations, and plans memory once.
 
 This is not an argument against quantization, which still contributes a further
-1.67x and the entire size reduction. It is an argument that runtime choice
+1.76x and the entire size reduction. It is an argument that runtime choice
 deserves the same scrutiny as model optimization, and gets less of it.
 
 ---
