@@ -396,13 +396,8 @@ cell state.
 - Install the CLI, once per machine:
 
     ```bash
-    uv tool install git+https://github.com/googlecolab/google-colab-cli.git@v0.7.0
+    uv tool install 'google-colab-cli>=0.7.0'
     ```
-
-> [!IMPORTANT]
-> Install from the git tag, not from PyPI. `colab ssh` was added in **v0.7.0**,
-> and `uv tool install google-colab-cli` still resolves to v0.6.0, which has no
-> `ssh` subcommand at all. A later tag is fine, an earlier one is not.
 
 - Create an SSH key if you do not have one. It must not be group or world
   readable, or SSH refuses to use it:
