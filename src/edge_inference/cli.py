@@ -23,6 +23,7 @@ from edge_inference.config import (
     seed_everything,
 )
 from edge_inference.data import build_dataloader, load_split
+from edge_inference.exit_analysis import default_thresholds, exit_vectors, sweep_thresholds
 from edge_inference.exit_profiler import profile_exits
 from edge_inference.export import (
     DEFAULT_OPSET,
@@ -462,6 +463,54 @@ def cmd_exits_profile(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_exits_sweep(args: argparse.Namespace) -> int:
+    """Exit vectors and a confidence-threshold sweep from a recorded profile."""
+    profile = Path(args.profile)
+    if not profile.exists():
+        console.print(f"[bold red]No profile at {profile}.[/bold red] Run `edge exits profile`.")
+        return 1
+    frame = pd.read_csv(profile)
+
+    vectors = exit_vectors(frame)
+    table = Table(title=f"Exit vectors, {frame['image'].nunique()} images")
+    for column in ("exit", "c (MMAC)", "a (accuracy)", "median ms", "p95 ms"):
+        table.add_column(column, justify="right")
+    for _, row in vectors.iterrows():
+        table.add_row(
+            row["exit_name"],
+            f"{row['mmacs']:.1f}",
+            f"{row['accuracy'] * 100:.2f}%",
+            f"{row['median_ms']:.2f}",
+            f"{row['p95_ms']:.2f}",
+        )
+    console.print(table)
+
+    sweep = sweep_thresholds(frame, default_thresholds())
+    table = Table(title="Stop at the first exit at least this confident")
+    columns = ("threshold", "accuracy", "mean ms", "p95 ms", "exit 1", "exit 2", "exit 3")
+    for column in columns:
+        table.add_column(column, justify="right")
+    for _, row in sweep.iterrows():
+        table.add_row(
+            f"{row['threshold']:.2f}",
+            f"{row['accuracy'] * 100:.2f}%",
+            f"{row['mean_ms']:.2f}",
+            f"{row['p95_ms']:.2f}",
+            *(f"{row[f'share_exit{i}'] * 100:.0f}%" for i in (1, 2, 3)),
+        )
+    console.print(table)
+
+    # Outputs are named after the profile they came from, so sweeps of
+    # different models and configurations sit side by side.
+    stem = profile.stem.removeprefix("exit_profile_")
+    vectors_out = profile.with_name(f"exit_vectors_{stem}.csv")
+    sweep_out = profile.with_name(f"exit_sweep_{stem}.csv")
+    vectors.to_csv(vectors_out, index=False)
+    sweep.to_csv(sweep_out, index=False)
+    console.print(f"Wrote [bold]{vectors_out}[/bold] and [bold]{sweep_out}[/bold]")
+    return 0
+
+
 def cmd_bench(args: argparse.Namespace) -> int:
     """Sweep thread counts and record forward pass latency for each."""
     seed_everything()
@@ -657,6 +706,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--out", default=None, help="default names the runtime, precision and thread count"
     )
     exits_profile.set_defaults(func=cmd_exits_profile)
+
+    exits_sweep = exits_sub.add_parser(
+        "sweep", help="exit vectors and a confidence-threshold sweep from a profile"
+    )
+    exits_sweep.add_argument("profile", help="CSV written by `edge exits profile`")
+    exits_sweep.set_defaults(func=cmd_exits_sweep)
 
     bench = subparsers.add_parser("bench", help="measure forward pass latency")
     bench.add_argument("--backbone", default="resnet18", choices=SUPPORTED_BACKBONES)
