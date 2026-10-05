@@ -5,30 +5,33 @@ CPU-only path with constrained cores, the deployment setting edge hardware
 imposes.
 
 ---
+
 ## **Navigation**
+
 - [Overview](#overview)
 - [How measurements are taken](#how-measurements-are-taken)
 - [Project Structure](#project-structure)
 - [Requirements](#requirements)
 - [Setup](#setup)
-  - [Why the extra is required](#why-the-extra-is-required)
+    - [Why the extra is required](#why-the-extra-is-required)
 - [Usage](#usage)
-  - [Prepare the dataset](#prepare-the-dataset)
-  - [Measure latency](#measure-latency)
-  - [Fine-tune the backbone](#fine-tune-the-backbone)
-  - [Profile the model](#profile-the-model)
-  - [Export to ONNX](#export-to-onnx)
-  - [Quantize to INT8](#quantize-to-int8)
+    - [Prepare the dataset](#prepare-the-dataset)
+    - [Measure latency](#measure-latency)
+    - [Fine-tune the backbone](#fine-tune-the-backbone)
+    - [Profile the model](#profile-the-model)
+    - [Export to ONNX](#export-to-onnx)
+    - [Quantize to INT8](#quantize-to-int8)
 - [Training on a GPU machine](#training-on-a-gpu-machine)
-  - [Getting a Colab runtime](#getting-a-colab-runtime)
-  - [On the runtime](#on-the-runtime)
-  - [Bringing results back](#bringing-results-back)
+    - [Getting a Colab runtime](#getting-a-colab-runtime)
+    - [On the runtime](#on-the-runtime)
+    - [Bringing results back](#bringing-results-back)
 - [Results](#results)
 - [Troubleshooting](#troubleshooting)
 - [Tech Stack](#tech-stack)
 - [Reference Papers](#reference-papers)
 
 ---
+
 ## Overview
 
 The model under test is ResNet-18, a convolutional network pretrained on
@@ -43,19 +46,20 @@ tunable accuracy and latency trade-off.
 Following Angelucci et al. (2026), a network with early exits is characterised
 by two vectors:
 
-| Vector | Meaning |
-|---|---|
-| `c` | operations, in MOPs, required to reach each exit |
-| `a` | accuracy at each exit, evaluated over the whole test set |
+| Vector | Meaning                                                  |
+| ------ | -------------------------------------------------------- |
+| `c`    | operations, in MOPs, required to reach each exit         |
+| `a`    | accuracy at each exit, evaluated over the whole test set |
 
 Those vectors are normally obtained by offline profiling, and a scheduler then
 treats the network as a black box described by them. This repository produces
 `c` and `a` from real measurements on real hardware, and studies how INT8
-quantization changes them, including whether quantization shifts *which* exit a
+quantization changes them, including whether quantization shifts _which_ exit a
 given image takes by perturbing the confidence scores the exit criterion
 depends on.
 
 ---
+
 ## How measurements are taken
 
 Latency is measured on CPU with batch size 1, warmup runs discarded, and
@@ -98,6 +102,7 @@ Each of those choices exists for a reason:
 > machine, with the CPU recorded in every row.
 
 ---
+
 ## Project Structure
 
 ```
@@ -122,6 +127,7 @@ datasets and weights stay out because they are large and reproducible from the
 code plus `uv.lock`.
 
 ---
+
 ## Requirements
 
 - **Python 3.14.** Some source here uses 3.14-only syntax, so an older
@@ -134,42 +140,43 @@ code plus `uv.lock`.
   [below](#training-on-a-gpu-machine).
 
 ---
+
 ## Setup
 
 - Clone the repository:
 
-  ```bash
-  git clone https://github.com/sannidhyaroy/edge-inference.git
-  cd edge-inference
-  ```
+    ```bash
+    git clone https://github.com/sannidhyaroy/edge-inference.git
+    cd edge-inference
+    ```
 
 - Create the environment and install dependencies:
 
-  ```bash
-  uv sync --extra cpu
-  ```
+    ```bash
+    uv sync --extra cpu
+    ```
 
-  This installs the exact versions recorded in `uv.lock`, including a matching
-  Python interpreter if you do not already have one.
+    This installs the exact versions recorded in `uv.lock`, including a matching
+    Python interpreter if you do not already have one.
 
 - Install the git hooks:
 
-  ```bash
-  uv run prek install
-  ```
+    ```bash
+    uv run prek install
+    ```
 
-  This wires [prek](https://github.com/j178/prek) into `.git/hooks/`, so `ruff`,
-  `pytest`, and a Conventional Commits check run before each commit.
+    This wires [prek](https://github.com/j178/prek) into `.git/hooks/`, so `ruff`,
+    `pytest`, and a Conventional Commits check run before each commit.
 
 ### Why the extra is required
 
 `torch` and `torchvision` do not appear in `dependencies`. They live in two
 mutually exclusive extras, and **a bare `uv sync` installs neither**:
 
-| Extra | Build | Use on |
-|---|---|---|
-| `cpu` | CPU-only, around 350 MB | measurement machines, where all reported latency comes from |
-| `cuda` | CUDA, around 2.5 GB | a training box with an NVIDIA GPU |
+| Extra  | Build                   | Use on                                                      |
+| ------ | ----------------------- | ----------------------------------------------------------- |
+| `cpu`  | CPU-only, around 350 MB | measurement machines, where all reported latency comes from |
+| `cuda` | CUDA, around 2.5 GB     | a training box with an NVIDIA GPU                           |
 
 The split exists because no environment marker can express "this machine has a
 usable GPU". Selecting by platform was the obvious alternative and it is wrong:
@@ -184,6 +191,7 @@ One lockfile holds both resolutions, so nothing diverges between machines.
 > CPU, and thread count it was measured under.
 
 ---
+
 ## Usage
 
 ### Prepare the dataset
@@ -343,8 +351,8 @@ Quantization stores weights and activations as 8-bit integers instead of
 - **Speed may or may not improve.** Entirely dependent on whether the CPU has
   instructions for 8-bit dot products.
 
-*Post-training* means quantizing a model that has finished training, with no
-retraining. *Static* means the value ranges are measured in advance from real
+_Post-training_ means quantizing a model that has finished training, with no
+retraining. _Static_ means the value ranges are measured in advance from real
 data rather than recomputed on every inference, which is what a deployed vision
 model wants: the cost is paid once, offline.
 
@@ -360,6 +368,7 @@ and those ranges decide how the float span maps onto 256 integer levels.
 > drop that looks like a quantization problem but is really a data problem.
 
 ---
+
 ## Training on a GPU machine
 
 Training is the one stage that need not happen on the measurement machine,
@@ -368,10 +377,10 @@ hardware-specific.
 
 The difference is large enough to matter:
 
-| Machine | Per epoch | Eight epochs |
-|---|---|---|
-| Ryzen 5 7530U, 6 cores | about 6 minutes | about 48 minutes |
-| Free Colab T4 | about 30 seconds | about 4 minutes |
+| Machine                | Per epoch        | Eight epochs     |
+| ---------------------- | ---------------- | ---------------- |
+| Ryzen 5 7530U, 6 cores | about 6 minutes  | about 48 minutes |
+| Free Colab T4          | about 30 seconds | about 4 minutes  |
 
 Per-epoch figures are measured: 35 images per second on the laptop CPU, and 85
 seconds for a three epoch run on the T4. The eight epoch totals follow from
@@ -386,9 +395,9 @@ cell state.
 
 - Install the CLI, once per machine:
 
-  ```bash
-  uv tool install git+https://github.com/googlecolab/google-colab-cli.git@v0.7.0
-  ```
+    ```bash
+    uv tool install git+https://github.com/googlecolab/google-colab-cli.git@v0.7.0
+    ```
 
 > [!IMPORTANT]
 > Install from the git tag, not from PyPI. `colab ssh` was added in **v0.7.0**,
@@ -398,26 +407,26 @@ cell state.
 - Create an SSH key if you do not have one. It must not be group or world
   readable, or SSH refuses to use it:
 
-  ```bash
-  ssh-keygen -t ed25519 -f ~/.ssh/colab
-  chmod 600 ~/.ssh/colab
-  ```
+    ```bash
+    ssh-keygen -t ed25519 -f ~/.ssh/colab
+    chmod 600 ~/.ssh/colab
+    ```
 
 - Create a runtime and connect to it:
 
-  ```bash
-  colab new -s edge --gpu T4
-  colab ssh -s edge -i ~/.ssh/colab
-  ```
+    ```bash
+    colab new -s edge --gpu T4
+    colab ssh -s edge -i ~/.ssh/colab
+    ```
 
-  The session name is arbitrary. With only one session running, `-s` can be
-  omitted entirely.
+    The session name is arbitrary. With only one session running, `-s` can be
+    omitted entirely.
 
 - When finished, stop it:
 
-  ```bash
-  colab stop -s edge
-  ```
+    ```bash
+    colab stop -s edge
+    ```
 
 > [!CAUTION]
 > A runtime consumes quota while alive, and its filesystem is **ephemeral**.
@@ -428,34 +437,34 @@ cell state.
 
 - Put the GPU driver libraries on the loader path:
 
-  ```bash
-  export LD_LIBRARY_PATH=/usr/lib64-nvidia:$LD_LIBRARY_PATH
-  ```
+    ```bash
+    export LD_LIBRARY_PATH=/usr/lib64-nvidia:$LD_LIBRARY_PATH
+    ```
 
-  This line is not optional, and the failure it prevents is thoroughly
-  misleading. See
-  [torch reports no CUDA device](#1-torch-reports-no-cuda-device-on-colab) for
-  what goes wrong without it.
+    This line is not optional, and the failure it prevents is thoroughly
+    misleading. See
+    [torch reports no CUDA device](#1-torch-reports-no-cuda-device-on-colab) for
+    what goes wrong without it.
 
 - Install uv, which is not present by default:
 
-  ```bash
-  curl -LsSf https://astral.sh/uv/0.12.1/install.sh | sh
-  ```
+    ```bash
+    curl -LsSf https://astral.sh/uv/0.12.1/install.sh | sh
+    ```
 
-  Pin the version to whatever `uv --version` reports on the machine that
-  generated `uv.lock`, so both resolve identically. It installs in about a second.
+    Pin the version to whatever `uv --version` reports on the machine that
+    generated `uv.lock`, so both resolve identically. It installs in about a second.
 
 - Clone and set up:
 
-  ```bash
-  git clone https://github.com/sannidhyaroy/edge-inference.git
-  cd edge-inference
-  uv sync --extra cuda
-  ```
+    ```bash
+    git clone https://github.com/sannidhyaroy/edge-inference.git
+    cd edge-inference
+    uv sync --extra cuda
+    ```
 
-  You do not need to install Python separately. Colab ships an older interpreter,
-  but `.python-version` is committed and uv fetches 3.14 during the sync.
+    You do not need to install Python separately. Colab ships an older interpreter,
+    but `.python-version` is committed and uv fetches 3.14 during the sync.
 
 > [!IMPORTANT]
 > `--extra cuda`, not `--extra cpu` and not a bare `uv sync`. A bare sync
@@ -465,17 +474,17 @@ cell state.
 
 - Download the dataset and train:
 
-  ```bash
-  uv run edge data prepare
-  uv run edge train --device cuda --epochs 8 --batch-size 64 --num-workers 2
-  ```
+    ```bash
+    uv run edge data prepare
+    uv run edge train --device cuda --epochs 8 --batch-size 64 --num-workers 2
+    ```
 
-  Expected output ends with something like:
+    Expected output ends with something like:
 
-  ```
-    epoch 8/8: train loss 0.1453, val loss 0.1000, val accuracy 96.89%
-  Final validation accuracy: 96.89% after 8 epoch(s), which is what was saved
-  ```
+    ```
+      epoch 8/8: train loss 0.1453, val loss 0.1000, val accuracy 96.89%
+    Final validation accuracy: 96.89% after 8 epoch(s), which is what was saved
+    ```
 
 > [!NOTE]
 > **Batch size goes up on a GPU, worker count does not.** 64 rather than 32 uses
@@ -501,6 +510,7 @@ Everything downstream, profiling and every latency measurement, runs locally on
 the CPU.
 
 ---
+
 ## Results
 
 ### Latency
@@ -509,12 +519,12 @@ ResNet-18 at 160px, batch size 1, on an HP ProBook 445 G10 (Ryzen 5 7530U, 6
 cores, 12 threads). 50 timed runs after 10 discarded warmup runs:
 
 | threads | median ms | p95 ms | std ms |
-| ---: | ---: | ---: | ---: |
-| 1 | 55.39 | 56.55 | 0.70 |
-| 2 | 30.26 | 31.38 | 0.53 |
-| 4 | 38.90 | 40.93 | 0.94 |
-| 6 | 24.07 | 29.24 | 1.95 |
-| 12 | 25.34 | 40.63 | 6.44 |
+| ------: | --------: | -----: | -----: |
+|       1 |     55.39 |  56.55 |   0.70 |
+|       2 |     30.26 |  31.38 |   0.53 |
+|       4 |     38.90 |  40.93 |   0.94 |
+|       6 |     24.07 |  29.24 |   1.95 |
+|      12 |     25.34 |  40.63 |   6.44 |
 
 **Six threads, one per physical core, is the best operating point.** Twelve
 oversubscribes those cores through SMT and buys nothing useful: the median
@@ -563,9 +573,9 @@ through ONNX Runtime, using the same code paths so the comparison describes the
 models rather than two harnesses:
 
 | precision | accuracy | size MiB | median ms | p95 ms |
-| --- | ---: | ---: | ---: | ---: |
-| float32 | 96.89% | 42.73 | 6.46 | 7.10 |
-| int8 | 96.41% | 10.83 | 3.88 | 4.43 |
+| --------- | -------: | -------: | --------: | -----: |
+| float32   |   96.89% |    42.73 |      6.46 |   7.10 |
+| int8      |   96.41% |    10.83 |      3.88 |   4.43 |
 
 **0.48 points of accuracy, 3.95x smaller, 1.67x faster.**
 
@@ -584,11 +594,11 @@ for measuring rather than reasoning from a datasheet.
 Worth putting beside the numbers above. The same float32 model, same 6 threads,
 same 160px input:
 
-| runtime | median ms |
-| --- | ---: |
-| PyTorch eager | 24.07 |
-| ONNX Runtime | 6.46 |
-| ONNX Runtime, INT8 | 3.88 |
+| runtime            | median ms |
+| ------------------ | --------: |
+| PyTorch eager      |     24.07 |
+| ONNX Runtime       |      6.46 |
+| ONNX Runtime, INT8 |      3.88 |
 
 **Changing the runtime alone was a 3.7x speedup**, more than twice what
 quantization then added on top. PyTorch dispatches operations one at a time
@@ -600,6 +610,7 @@ the execution runtime can outweigh the model optimization technique applied to
 it. Both are worth doing, but they are not the same size of lever.
 
 ---
+
 ## Troubleshooting
 
 ### 1. torch reports no CUDA device on Colab
@@ -621,7 +632,7 @@ genuinely has a GPU attached.
 `torch.cuda.is_available()` still returns `False`. Re-running `uv sync --extra
 cuda` changes nothing, which makes it look like a packaging problem.
 
-**Why does this happen?** The GPU is passed through correctly, but the *driver*
+**Why does this happen?** The GPU is passed through correctly, but the _driver_
 libraries live in `/usr/lib64-nvidia`, which `ldconfig` does not index. A Colab
 notebook kernel gets that directory injected into its environment; a shell
 opened over SSH does not, and `LD_LIBRARY_PATH` is empty. The CUDA toolkit comes
@@ -691,20 +702,22 @@ OMP_NUM_THREADS=2 uv run edge bench --threads 2
 > back from torch and recorded in every row rather than echoed from the request.
 
 ---
+
 ## Tech Stack
 
-| Purpose | Library |
-|---|---|
-| Model definitions and training | `torch`, `torchvision` |
-| Export and deployment runtime | `onnx`, `onnxruntime`, `onnxscript` |
-| Results handling | `pandas` |
-| Terminal output | `rich` |
-| Linting and formatting | `ruff` |
-| Tests | `pytest` |
-| Git hooks | `prek` |
-| Package management | `uv` |
+| Purpose                        | Library                             |
+| ------------------------------ | ----------------------------------- |
+| Model definitions and training | `torch`, `torchvision`              |
+| Export and deployment runtime  | `onnx`, `onnxruntime`, `onnxscript` |
+| Results handling               | `pandas`                            |
+| Terminal output                | `rich`                              |
+| Linting and formatting         | `ruff`                              |
+| Tests                          | `pytest`                            |
+| Git hooks                      | `prek`                              |
+| Package management             | `uv`                                |
 
 ---
+
 ## Reference Papers
 
 Citations, licenses, and how each paper relates to this work are in
