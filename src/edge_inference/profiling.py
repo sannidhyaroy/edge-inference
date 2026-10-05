@@ -20,6 +20,7 @@ from torch import nn
 from torch.utils.flop_counter import FlopCounterMode
 
 from edge_inference.config import IMAGE_SIZE
+from edge_inference.models import EarlyExitResNet
 
 
 def count_parameters(model: nn.Module) -> dict[str, int]:
@@ -96,6 +97,39 @@ def operations_by_module(
     # get_flop_counts maps a module path to a mapping of operator to count, so
     # the per-module total is the sum over its operators.
     return {module: float(sum(ops.values())) for module, ops in counter.get_flop_counts().items()}
+
+
+def operations_per_exit(
+    model: EarlyExitResNet,
+    *,
+    image_size: int = IMAGE_SIZE,
+    device: str = "cpu",
+) -> list[float]:
+    """Cumulative MACs needed to reach each exit, shallowest first.
+
+    This is the paper's `c` vector. Each entry counts every stage up to that
+    exit plus every head passed on the way, because a network that may stop
+    early has to evaluate each head it reaches to decide whether to stop.
+
+    A controller that picks the exit in advance would skip the earlier heads,
+    but each is a pooling step and one small linear layer, a few thousand
+    operations against hundreds of millions, so the two counts agree to well
+    under a tenth of a percent.
+    """
+    model = model.to(device).eval()
+    x = torch.randn(1, 3, image_size, image_size, device=device)
+
+    cumulative = 0.0
+    macs: list[float] = []
+    with torch.inference_mode():
+        for stage, head in zip(model.stages, model.heads, strict=True):
+            counter = FlopCounterMode(display=False)
+            with counter:
+                x = stage(x)
+                head(x)
+            cumulative += counter.get_total_flops() / 2
+            macs.append(cumulative)
+    return macs
 
 
 def checkpoint_size_bytes(path: Path) -> int:
