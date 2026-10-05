@@ -59,6 +59,19 @@ def test_machine_info_is_populated():
     assert info["cores_physical"] is None or isinstance(info["cores_physical"], int)
 
 
+def test_machine_info_records_power_conditions():
+    """Power and frequency policy changed latency twofold between two sessions.
+
+    The values may be None where a system exposes nothing, but the columns must
+    always exist, so rows from different machines line up.
+    """
+    info = machine_info()
+
+    for key in ("power_source", "governor", "energy_preference", "max_frequency_mhz"):
+        assert key in info
+    assert info["power_source"] in ("ac", "battery", None)
+
+
 def test_machine_info_excludes_hostname():
     """Results files are committed to a public repo, so no personal identifiers."""
     import platform

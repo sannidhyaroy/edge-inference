@@ -24,7 +24,13 @@ import time
 import torch
 from torch.utils.data import Dataset
 
-from edge_inference.bench import cpu_model, machine_model, set_thread_count
+from edge_inference.bench import (
+    cpu_model,
+    cpu_policy,
+    machine_model,
+    power_source,
+    set_thread_count,
+)
 from edge_inference.config import SEED
 from edge_inference.models import EXIT_NAMES, EarlyExitResNet
 
@@ -64,6 +70,9 @@ def profile_exits(
     model = model.to(device).eval()
     machine = machine_model()
     cpu = cpu_model()
+    # Read once at the start. Power and frequency policy decide latency by large
+    # factors on a laptop, so every row carries the conditions it ran under.
+    conditions = {"power_source": power_source(), **cpu_policy()}
 
     # A limited run takes a seeded random sample rather than the first N
     # images. Image folders are stored sorted by class, so the first N would
@@ -112,6 +121,7 @@ def profile_exits(
                         "threads": effective_threads,
                         "machine": machine,
                         "cpu": cpu,
+                        **conditions,
                     }
                 )
 

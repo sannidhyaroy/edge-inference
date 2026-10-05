@@ -163,6 +163,57 @@ def physical_cores() -> int | None:
     return None
 
 
+def _read(path: Path) -> str | None:
+    """Contents of a small sysfs file, or None if it does not exist here."""
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return None
+
+
+def power_source() -> str | None:
+    """ "ac" or "battery", or None where it cannot be determined.
+
+    Recorded because it changes latency by large factors on a laptop. A battery
+    run is a legitimate measurement, arguably a closer stand-in for a
+    constrained edge device, but it must never be mistaken for a plugged-in one.
+    """
+    system = platform.system()
+    if system == "Linux":
+        for supply in Path("/sys/class/power_supply").glob("*"):
+            if _read(supply / "type") == "Mains":
+                return "ac" if _read(supply / "online") == "1" else "battery"
+    elif system == "Darwin":
+        try:
+            result = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True)
+        except OSError:
+            return None
+        if "AC Power" in result.stdout:
+            return "ac"
+        if "Battery Power" in result.stdout:
+            return "battery"
+    return None
+
+
+def cpu_policy() -> dict[str, object]:
+    """How the operating system is currently allowed to clock the CPU.
+
+    The same CPU at the same thread count measured twice as slow a month apart,
+    almost certainly because a frequency manager was holding it at base clock.
+    Nothing in a result row could show that. The governor, the energy
+    preference and the highest frequency the CPU may reach right now can.
+
+    Linux only: other systems expose no equivalent and report nothing.
+    """
+    cpufreq = Path("/sys/devices/system/cpu/cpu0/cpufreq")
+    max_khz = _read(cpufreq / "scaling_max_freq")
+    return {
+        "governor": _read(cpufreq / "scaling_governor"),
+        "energy_preference": _read(cpufreq / "energy_performance_preference"),
+        "max_frequency_mhz": int(max_khz) // 1000 if max_khz and max_khz.isdigit() else None,
+    }
+
+
 def machine_info() -> dict[str, object]:
     """Describe the machine well enough to interpret a latency row later.
 
@@ -176,6 +227,8 @@ def machine_info() -> dict[str, object]:
         "cpu": cpu_model(),
         "cores_physical": physical_cores(),
         "cores_logical": os.cpu_count(),
+        "power_source": power_source(),
+        **cpu_policy(),
         "system": platform.system(),
         "arch": platform.machine(),
         "python_version": platform.python_version(),
