@@ -29,8 +29,10 @@ from edge_inference.export import (
     DEFAULT_OPSET,
     build_session,
     evaluate_session,
+    export_exit_stages,
     export_onnx,
     verify_parity,
+    verify_stage_parity,
 )
 from edge_inference.models import (
     EXIT_NAMES,
@@ -468,6 +470,71 @@ def cmd_exits_profile(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_exits_export(args: argparse.Namespace) -> int:
+    """Export each stage of an early-exit model to ONNX and verify every exit."""
+    seed_everything()
+
+    model = build_early_exit(args.backbone, num_classes=NUM_CLASSES)
+    checkpoint = Path(args.checkpoint)
+    if not checkpoint.exists():
+        console.print(
+            f"[bold red]No checkpoint at {checkpoint}.[/bold red] "
+            "Train one with `edge train --early-exit` first."
+        )
+        return 1
+    load_checkpoint(model, checkpoint)
+
+    # Stage graphs sit beside the checkpoint they came from, named after it.
+    paths = export_exit_stages(
+        model, checkpoint.with_suffix(""), image_size=args.image_size, opset=args.opset
+    )
+    for path in paths:
+        console.print(f"Exported [bold]{path}[/bold] ({path.stat().st_size / 2**20:.2f} MiB)")
+
+    rows = verify_stage_parity(
+        model, paths, image_size=args.image_size, samples=args.samples, atol=args.atol
+    )
+
+    table = Table(title="PyTorch against chained ONNX Runtime stages")
+    for column in ("exit", "max abs error", "mean abs error", "prediction agreement"):
+        table.add_column(column, justify="right")
+    for row in rows:
+        table.add_row(
+            row["exit_name"],
+            f"{row['max_abs_error']:.3e}",
+            f"{row['mean_abs_error']:.3e}",
+            f"{row['prediction_agreement'] * 100:.1f}%",
+        )
+    console.print(table)
+
+    for row, path in zip(rows, paths, strict=True):
+        row["backbone"] = args.backbone
+        row["checkpoint"] = checkpoint.name
+        row["opset"] = args.opset
+        row["onnx_mib"] = path.stat().st_size / 2**20
+
+    results = Path(args.results or RESULTS_DIR / f"onnx_parity_{checkpoint.stem}.csv")
+    results.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(results, index=False)
+    console.print(f"Wrote [bold]{results}[/bold]")
+
+    # As with the plain export, a flipped prediction at any exit is an error.
+    failed = [row["exit_name"] for row in rows if not row["predictions_match"]]
+    if failed:
+        console.print(
+            f"[bold red]Parity failed[/bold red] at {', '.join(failed)}. "
+            "Do not measure against these files."
+        )
+        return 1
+    loose = [row["exit_name"] for row in rows if not row["within_tolerance"]]
+    if loose:
+        console.print(
+            f"[bold yellow]Note:[/bold yellow] {', '.join(loose)} exceeded the "
+            f"{args.atol:.0e} tolerance, but every prediction still agrees."
+        )
+    return 0
+
+
 def cmd_exits_sweep(args: argparse.Namespace) -> int:
     """Exit vectors and a confidence-threshold sweep from a recorded profile."""
     profile = Path(args.profile)
@@ -712,6 +779,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--out", default=None, help="default names the runtime, precision and thread count"
     )
     exits_profile.set_defaults(func=cmd_exits_profile)
+
+    exits_export = exits_sub.add_parser(
+        "export", help="export each stage to ONNX and verify every exit against PyTorch"
+    )
+    exits_export.add_argument("--backbone", default="resnet18", choices=SUPPORTED_BACKBONES)
+    exits_export.add_argument(
+        "--checkpoint", default=str(CHECKPOINT_DIR / "resnet18_early_exit_imagenette.pt")
+    )
+    exits_export.add_argument("--image-size", type=int, default=IMAGE_SIZE)
+    exits_export.add_argument("--opset", type=int, default=DEFAULT_OPSET, help="ONNX opset version")
+    exits_export.add_argument("--samples", type=int, default=8, help="inputs compared for parity")
+    exits_export.add_argument(
+        "--atol",
+        type=float,
+        default=1e-4,
+        help="absolute tolerance on raw outputs; predictions must match regardless",
+    )
+    exits_export.add_argument(
+        "--results", default=None, help="parity CSV (default names the checkpoint)"
+    )
+    exits_export.set_defaults(func=cmd_exits_export)
 
     exits_sweep = exits_sub.add_parser(
         "sweep", help="exit vectors and a confidence-threshold sweep from a profile"

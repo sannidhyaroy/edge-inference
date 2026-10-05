@@ -72,3 +72,24 @@ def test_batch_axis_is_dynamic(tmp_path):
         inputs = torch.randn(batch, 3, IMAGE_SIZE, IMAGE_SIZE).numpy()
         outputs = session.run(None, {INPUT_NAME: inputs})[0]
         assert outputs.shape[0] == batch
+
+
+def test_chained_stages_match_every_exit(tmp_path):
+    """Stage graphs fed each other's outputs must reproduce all three exits.
+
+    This is the deployed path for early exit, so a stage that exported wrongly
+    or a features tensor handed over in the wrong shape must fail here.
+    """
+    from edge_inference.export import export_exit_stages, verify_stage_parity
+    from edge_inference.models import EXIT_NAMES, build_early_exit
+
+    torch.manual_seed(0)
+    model = build_early_exit(num_classes=4)
+    paths = export_exit_stages(model, tmp_path / "tiny", image_size=IMAGE_SIZE)
+
+    rows = verify_stage_parity(model, paths, image_size=IMAGE_SIZE, samples=4)
+
+    assert [row["exit_name"] for row in rows] == list(EXIT_NAMES)
+    for row in rows:
+        assert row["predictions_match"], f"{row['exit_name']} predicted a different class"
+        assert row["within_tolerance"], f"{row['exit_name']} max error {row['max_abs_error']:.3e}"

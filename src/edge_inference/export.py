@@ -18,6 +18,7 @@ a model that was never evaluated for accuracy. `verify_parity` exists to make
 that failure loud rather than silent.
 """
 
+from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
@@ -27,6 +28,7 @@ import torch
 from torch import nn
 
 from edge_inference.config import IMAGE_SIZE, SEED
+from edge_inference.models import EXIT_NAMES, EarlyExitResNet
 
 # What torch's dynamo exporter emits natively for these models. Requesting an
 # older opset makes it export at 18 and then down-convert, which fails for this
@@ -36,6 +38,9 @@ DEFAULT_OPSET = 18
 
 INPUT_NAME = "input"
 OUTPUT_NAME = "logits"
+# What an early-exit stage hands to the next stage, or across the network when
+# the model is split.
+FEATURES_NAME = "features"
 
 
 def export_onnx(
@@ -44,8 +49,14 @@ def export_onnx(
     *,
     image_size: int = IMAGE_SIZE,
     opset: int = DEFAULT_OPSET,
+    example: torch.Tensor | None = None,
+    output_names: Sequence[str] = (OUTPUT_NAME,),
 ) -> Path:
     """Export `model` to ONNX at `path` and return the path.
+
+    `example` defaults to one image. A model whose input is not an image, such
+    as a later stage of an early-exit network, passes a tensor of its own input
+    shape instead.
 
     The batch dimension is marked dynamic. Inference here is always batch size
     one, but calibrating a quantized model feeds batches through the same file,
@@ -61,14 +72,15 @@ def export_onnx(
     path.parent.mkdir(parents=True, exist_ok=True)
     model = model.to("cpu").eval()
 
-    example = torch.randn(1, 3, image_size, image_size)
+    if example is None:
+        example = torch.randn(1, 3, image_size, image_size)
 
     torch.onnx.export(
         model,
         (example,),
         str(path),
         input_names=[INPUT_NAME],
-        output_names=[OUTPUT_NAME],
+        output_names=list(output_names),
         # `dynamic_shapes` rather than the older `dynamic_axes`, which is
         # deprecated. Dim.DYNAMIC lets the exporter infer the bounds instead of
         # a named Dim, which historically defaults to a minimum of 2 and would
@@ -99,6 +111,80 @@ def exported_opset(path: Path) -> int:
         if entry.domain in ("", "ai.onnx"):
             return entry.version
     raise ValueError(f"{path} declares no default-domain opset")
+
+
+class ExitStage(nn.Module):
+    """One stage of an early-exit network and the exit head after it.
+
+    Exported as one graph per stage because a single graph cannot stop early:
+    ONNX Runtime runs a graph to the end, so an exit decision has to happen
+    between graphs. The application runs stage one, reads the exit's
+    confidence, and only then decides whether to run stage two on the features.
+
+    The same boundary is where split computing cuts the network, so the
+    `features` output is also the tensor that would cross the network.
+    """
+
+    def __init__(self, stage: nn.Module, head: nn.Module, *, last: bool) -> None:
+        super().__init__()
+        self.stage = stage
+        self.head = head
+        self.last = last
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        features = self.stage(x)
+        logits = self.head(features)
+        # Nothing runs after the last stage, so its features have nowhere to go.
+        if self.last:
+            return logits
+        return features, logits
+
+
+def stage_paths(base: Path) -> list[Path]:
+    """Where each stage graph of the model at `base` (no suffix) is written."""
+    return [
+        base.with_name(f"{base.name}.stage{index}.onnx") for index in range(1, len(EXIT_NAMES) + 1)
+    ]
+
+
+def export_exit_stages(
+    model: EarlyExitResNet,
+    base: Path,
+    *,
+    image_size: int = IMAGE_SIZE,
+    opset: int = DEFAULT_OPSET,
+) -> list[Path]:
+    """Export each stage of an early-exit model as its own graph.
+
+    Each later stage is traced with the previous stage's real output as its
+    example, so its input shape is whatever that stage actually produces.
+    """
+    model = model.to("cpu").eval()
+    paths = stage_paths(base)
+    x = torch.randn(1, 3, image_size, image_size)
+
+    for index, (stage, head, path) in enumerate(zip(model.stages, model.heads, paths, strict=True)):
+        last = index == len(paths) - 1
+        export_onnx(
+            ExitStage(stage, head, last=last),
+            path,
+            opset=opset,
+            example=x,
+            output_names=(OUTPUT_NAME,) if last else (FEATURES_NAME, OUTPUT_NAME),
+        )
+        # no_grad rather than inference_mode: a tensor made under inference
+        # mode cannot be traced, and the exporter's default non-strict tracing
+        # fails on it before silently retrying in strict mode.
+        with torch.no_grad():
+            x = stage(x)
+
+    return paths
+
+
+def run_stage(session: ort.InferenceSession, x: np.ndarray) -> dict[str, np.ndarray]:
+    """Run one stage graph and return its outputs by name."""
+    names = [output.name for output in session.get_outputs()]
+    return dict(zip(names, session.run(names, {INPUT_NAME: x}), strict=True))
 
 
 def build_session(path: Path, *, threads: int = 1) -> ort.InferenceSession:
@@ -174,6 +260,52 @@ def verify_parity(
 
     onnx_output = session.run(None, {INPUT_NAME: inputs.numpy()})[0]
 
+    return _compare(torch_output, onnx_output, samples=samples, atol=atol)
+
+
+def verify_stage_parity(
+    model: EarlyExitResNet,
+    paths: Sequence[Path],
+    *,
+    image_size: int = IMAGE_SIZE,
+    samples: int = 8,
+    atol: float = 1e-4,
+) -> list[dict[str, float]]:
+    """Compare every exit of the chained stage graphs against PyTorch.
+
+    The graphs are chained the way they run when deployed: each stage receives
+    the previous ONNX stage's features, not PyTorch's. Any error a stage
+    introduces therefore reaches every later exit, and is caught there if it
+    grows enough to matter. One row is returned per exit, checked as in
+    `verify_parity`.
+    """
+    model = model.to("cpu").eval()
+    sessions = [build_session(path) for path in paths]
+
+    generator = torch.Generator().manual_seed(SEED)
+    inputs = torch.randn(samples, 3, image_size, image_size, generator=generator)
+
+    with torch.inference_mode():
+        torch_outputs = [output.numpy() for output in model(inputs)]
+
+    rows = []
+    x = inputs.numpy()
+    for name, session, expected in zip(EXIT_NAMES, sessions, torch_outputs, strict=True):
+        outputs = run_stage(session, x)
+        row = _compare(expected, outputs[OUTPUT_NAME], samples=samples, atol=atol)
+        rows.append({"exit_name": name, **row})
+        x = outputs.get(FEATURES_NAME)
+    return rows
+
+
+def _compare(
+    torch_output: np.ndarray,
+    onnx_output: np.ndarray,
+    *,
+    samples: int,
+    atol: float,
+) -> dict[str, float]:
+    """Numerical and prediction agreement between two sets of class scores."""
     absolute_error = np.abs(torch_output - onnx_output)
     torch_predictions = torch_output.argmax(axis=1)
     onnx_predictions = onnx_output.argmax(axis=1)
