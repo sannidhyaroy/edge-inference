@@ -1,0 +1,4 @@
+exit_name,samples,max_abs_error,mean_abs_error,prediction_agreement,tolerance,within_tolerance,predictions_match,backbone,checkpoint,opset,onnx_mib
+layer2,8,2.384185791015625e-07,5.7392753660678864e-08,1.0,0.0001,True,True,resnet18,resnet18_early_exit_w0.3.pt,18,2.6631317138671875
+layer3,8,3.8743019104003906e-07,9.820796265103127e-08,1.0,0.0001,True,True,resnet18,resnet18_early_exit_w0.3.pt,18,8.04224681854248
+layer4,8,2.86102294921875e-06,9.577721584719256e-07,1.0,0.0001,True,True,resnet18,resnet18_early_exit_w0.3.pt,18,32.0567684173584
