@@ -18,7 +18,7 @@ apart:
   memory
 """
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 
 import torch
 from rich.console import Console
@@ -29,6 +29,26 @@ from torch.utils.data import DataLoader
 console = Console()
 
 
+def combined_loss(
+    outputs: list[torch.Tensor],
+    targets: torch.Tensor,
+    criterion: nn.Module,
+    weights: Sequence[float],
+) -> torch.Tensor:
+    """Weighted average of the loss at every exit.
+
+    Training every exit at once is what makes the early heads useful: the
+    backbone learns features that serve a shallow classifier and a deep one
+    together, rather than features tuned only for the end of the network.
+
+    An average rather than a sum keeps the loss on the same scale as a
+    single-exit model, so the learning rate that worked for the baseline still
+    makes sense here.
+    """
+    total = sum(w * criterion(output, targets) for w, output in zip(weights, outputs, strict=True))
+    return total / sum(weights)
+
+
 def run_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -36,12 +56,14 @@ def run_epoch(
     device: str,
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer | None = None,
+    exit_weights: Sequence[float] | None = None,
     progress: Progress | None = None,
     description: str = "",
-) -> dict[str, float]:
+) -> dict[str, float | list[float]]:
     """Run one pass over `loader`, training if an optimizer is given.
 
-    Returns the mean loss and the accuracy over the whole pass.
+    Returns the mean loss, the accuracy of the final exit, and the accuracy of
+    every exit. A plain model has one exit, so the last two agree.
 
     Passing `optimizer=None` makes this an evaluation pass: no weights change
     and no gradients are tracked.
@@ -50,7 +72,7 @@ def run_epoch(
     model.train(training)
 
     total_loss = 0.0
-    correct = 0
+    correct: list[int] | None = None
     seen = 0
 
     task = None
@@ -67,7 +89,12 @@ def run_epoch(
             targets = targets.to(device, non_blocking=True)
 
             outputs = model(images)
-            loss = criterion(outputs, targets)
+            # A plain model returns one tensor and an early-exit model returns
+            # one per exit. Treating both as a list keeps a single code path.
+            if isinstance(outputs, torch.Tensor):
+                outputs = [outputs]
+            weights = exit_weights or [1.0] * len(outputs)
+            loss = combined_loss(outputs, targets, criterion, weights)
 
             if training:
                 # Gradients accumulate by default, so they must be cleared
@@ -81,7 +108,10 @@ def run_epoch(
             # argmax over the class dimension turns raw scores into a predicted
             # label. The scores need no softmax first: it is monotonic, so it
             # cannot change which class is largest.
-            correct += (outputs.argmax(dim=1) == targets).sum().item()
+            hits = [(output.argmax(dim=1) == targets).sum().item() for output in outputs]
+            correct = (
+                hits if correct is None else [c + h for c, h in zip(correct, hits, strict=True)]
+            )
             seen += batch_size
 
             if progress is not None and task is not None:
@@ -90,9 +120,11 @@ def run_epoch(
     if progress is not None and task is not None:
         progress.remove_task(task)
 
+    exit_accuracies = [c / seen for c in correct]
     return {
         "loss": total_loss / seen,
-        "accuracy": correct / seen,
+        "accuracy": exit_accuracies[-1],
+        "exit_accuracies": exit_accuracies,
     }
 
 
@@ -106,6 +138,7 @@ def fine_tune(
     learning_rate: float,
     momentum: float = 0.9,
     weight_decay: float = 1e-4,
+    exit_weights: Sequence[float] | None = None,
 ) -> list[dict[str, float]]:
     """Fine-tune `model` and return one metrics row per epoch.
 
@@ -150,6 +183,7 @@ def fine_tune(
                 device=device,
                 criterion=criterion,
                 optimizer=optimizer,
+                exit_weights=exit_weights,
                 progress=progress,
                 description=f"epoch {epoch}/{epochs} train",
             )
@@ -158,6 +192,7 @@ def fine_tune(
                 val_loader,
                 device=device,
                 criterion=criterion,
+                exit_weights=exit_weights,
                 progress=progress,
                 description=f"epoch {epoch}/{epochs} val",
             )
@@ -174,13 +209,22 @@ def fine_tune(
                 "val_loss": val_metrics["loss"],
                 "val_accuracy": val_metrics["accuracy"],
             }
+            # One column per exit, only when there is more than one, so a plain
+            # model's history keeps exactly the columns it had before.
+            exit_accuracies = val_metrics["exit_accuracies"]
+            if len(exit_accuracies) > 1:
+                for index, accuracy in enumerate(exit_accuracies, start=1):
+                    row[f"val_accuracy_exit{index}"] = accuracy
             history.append(row)
 
+            per_exit = ""
+            if len(exit_accuracies) > 1:
+                per_exit = " (exits " + ", ".join(f"{a * 100:.2f}%" for a in exit_accuracies) + ")"
             console.print(
                 f"  epoch {epoch}/{epochs}: "
                 f"train loss {row['train_loss']:.4f}, "
                 f"val loss {row['val_loss']:.4f}, "
-                f"val accuracy [bold]{row['val_accuracy'] * 100:.2f}%[/bold]"
+                f"val accuracy [bold]{row['val_accuracy'] * 100:.2f}%[/bold]{per_exit}"
             )
 
     return history

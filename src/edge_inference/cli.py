@@ -30,7 +30,12 @@ from edge_inference.export import (
     export_onnx,
     verify_parity,
 )
-from edge_inference.models import SUPPORTED_BACKBONES, build_backbone
+from edge_inference.models import (
+    EXIT_NAMES,
+    SUPPORTED_BACKBONES,
+    build_backbone,
+    build_early_exit,
+)
 from edge_inference.profiling import profile_model
 from edge_inference.quantization import DataLoaderCalibrationReader, quantize_onnx
 from edge_inference.training import fine_tune
@@ -56,6 +61,20 @@ def parse_thread_list(value: str) -> list[int]:
     if not threads or threads[0] < 1:
         raise argparse.ArgumentTypeError("thread counts must be positive integers")
     return threads
+
+
+def parse_weight_list(value: str) -> list[float]:
+    """Parse "1,1,1" into a list of non-negative loss weights."""
+    try:
+        weights = [float(part) for part in value.split(",") if part.strip()]
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected a comma separated list of numbers, got {value!r}"
+        ) from None
+
+    if not weights or any(w < 0 for w in weights) or sum(weights) == 0:
+        raise argparse.ArgumentTypeError("weights must be non-negative and not all zero")
+    return weights
 
 
 def directory_size_mb(path: Path) -> float:
@@ -105,10 +124,29 @@ def cmd_train(args: argparse.Namespace) -> int:
         num_workers=args.num_workers,
     )
 
-    model = build_backbone(args.backbone, num_classes=NUM_CLASSES, pretrained=True)
+    if args.early_exit:
+        model = build_early_exit(args.backbone, num_classes=NUM_CLASSES, pretrained=True)
+        exit_weights = args.exit_weights
+        if len(exit_weights) != len(EXIT_NAMES):
+            console.print(
+                f"[bold red]--exit-weights needs {len(EXIT_NAMES)} values, "
+                f"one per exit ({', '.join(EXIT_NAMES)}).[/bold red]"
+            )
+            return 2
+        variant = "early_exit"
+    else:
+        model = build_backbone(args.backbone, num_classes=NUM_CLASSES, pretrained=True)
+        exit_weights = None
+        variant = "plain"
+
+    # Defaults depend on the variant, so a plain run and an early-exit run never
+    # overwrite each other's checkpoint or history.
+    suffix = "_early_exit" if args.early_exit else ""
+    out = args.out or str(CHECKPOINT_DIR / f"{args.backbone}{suffix}_imagenette.pt")
+    history_out = args.history or str(RESULTS_DIR / f"training_history{suffix}.csv")
 
     console.print(
-        f"Fine-tuning [bold]{args.backbone}[/bold] on {len(train_dataset)} images, "
+        f"Fine-tuning [bold]{args.backbone}[/bold] ({variant}) on {len(train_dataset)} images, "
         f"validating on {len(val_dataset)}, for {args.epochs} epoch(s) on {device}"
     )
 
@@ -119,9 +157,10 @@ def cmd_train(args: argparse.Namespace) -> int:
         device=device,
         epochs=args.epochs,
         learning_rate=args.lr,
+        exit_weights=exit_weights,
     )
 
-    checkpoint = Path(args.out)
+    checkpoint = Path(out)
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
     # Only the weights are saved, not the whole model object. A state dict is a
     # plain mapping of tensors, so it loads without needing the original class
@@ -133,8 +172,11 @@ def cmd_train(args: argparse.Namespace) -> int:
     frame["backbone"] = args.backbone
     frame["device"] = device
     frame["batch_size"] = args.batch_size
+    frame["variant"] = variant
+    if exit_weights is not None:
+        frame["exit_weights"] = ",".join(str(w) for w in exit_weights)
 
-    history_path = Path(args.history)
+    history_path = Path(history_out)
     history_path.parent.mkdir(parents=True, exist_ok=True)
     frame.to_csv(history_path, index=False)
     console.print(f"Wrote [bold]{history_path}[/bold]")
@@ -460,8 +502,23 @@ def build_parser() -> argparse.ArgumentParser:
             "compute threads, so more is not always better"
         ),
     )
-    train.add_argument("--out", default=str(CHECKPOINT_DIR / "resnet18_imagenette.pt"))
-    train.add_argument("--history", default=str(RESULTS_DIR / "training_history.csv"))
+    train.add_argument(
+        "--early-exit",
+        action="store_true",
+        help=f"attach exit heads after {', '.join(EXIT_NAMES[:-1])} and train all exits jointly",
+    )
+    train.add_argument(
+        "--exit-weights",
+        type=parse_weight_list,
+        default=parse_weight_list("1,1,1"),
+        help="relative loss weight per exit, shallowest first (default: 1,1,1)",
+    )
+    train.add_argument(
+        "--out",
+        default=None,
+        help="checkpoint path (default depends on --early-exit, so runs never overwrite)",
+    )
+    train.add_argument("--history", default=None, help="per-epoch metrics CSV")
     train.set_defaults(func=cmd_train)
 
     export = subparsers.add_parser("export", help="export to ONNX and verify against PyTorch")
