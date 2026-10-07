@@ -93,3 +93,56 @@ def test_chained_stages_match_every_exit(tmp_path):
     for row in rows:
         assert row["predictions_match"], f"{row['exit_name']} predicted a different class"
         assert row["within_tolerance"], f"{row['exit_name']} max error {row['max_abs_error']:.3e}"
+
+
+SHARED_POOL_CHECK = """
+import sys
+from pathlib import Path
+
+import torch
+
+from edge_inference.export import (
+    FEATURES_NAME, OUTPUT_NAME, build_session, build_stage_sessions, export_exit_stages, run_stage,
+)
+from edge_inference.models import build_early_exit
+
+torch.manual_seed(0)
+paths = export_exit_stages(build_early_exit(num_classes=4), Path(sys.argv[1]) / "tiny", image_size=32)
+sessions = build_stage_sessions(paths, threads=1)
+
+x = torch.randn(1, 3, 32, 32).numpy()
+for session in sessions:
+    outputs = run_stage(session, x)
+    x = outputs.get(FEATURES_NAME)
+assert outputs[OUTPUT_NAME].shape == (1, 4)
+
+build_session(paths[0], threads=1)  # joins the shared pool instead of failing
+
+try:
+    build_stage_sessions(paths, threads=2)
+except RuntimeError as error:
+    assert "separate process" in str(error)
+else:
+    raise AssertionError("a second pool size was accepted")
+"""
+
+
+def test_shared_pool_stages_chain_and_refuse_a_second_size(tmp_path):
+    """Stages on the shared pool must chain like any others, at one size only.
+
+    A second thread count in the same process cannot take effect, since the
+    pool is sized once, so it must raise rather than quietly time stages at
+    the first count and record them as the second. Runs in its own process
+    because the pool, once created, outlives the test and would force every
+    later session onto it.
+    """
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "-c", SHARED_POOL_CHECK, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]

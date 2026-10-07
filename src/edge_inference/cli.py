@@ -28,6 +28,7 @@ from edge_inference.exit_profiler import profile_exit_sessions, profile_exits
 from edge_inference.export import (
     DEFAULT_OPSET,
     build_session,
+    build_stage_sessions,
     evaluate_session,
     evaluate_stages,
     export_exit_stages,
@@ -457,7 +458,7 @@ def cmd_exits_profile(args: argparse.Namespace) -> int:
             )
             return 1
         rows = profile_exit_sessions(
-            [build_session(path, threads=args.threads) for path in paths],
+            build_stage_sessions(paths, threads=args.threads),
             dataset,
             threads=args.threads,
             warmup=args.warmup,
@@ -672,7 +673,7 @@ def cmd_split_profile(args: argparse.Namespace) -> int:
         f"{args.precision} stages, {args.threads} thread(s)"
     )
     rows = profile_splits(
-        [build_session(path, threads=args.threads) for path in paths],
+        build_stage_sessions(paths, threads=args.threads),
         dataset,
         threads=args.threads,
         warmup=args.warmup,
