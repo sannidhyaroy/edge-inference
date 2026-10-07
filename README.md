@@ -540,16 +540,16 @@ cell state.
 
 ### On the runtime
 
-- Put the GPU driver libraries on the loader path:
+- Check the GPU is visible:
 
     ```bash
-    export LD_LIBRARY_PATH=/usr/lib64-nvidia:$LD_LIBRARY_PATH
+    nvidia-smi
     ```
 
-    This line is not optional, and the failure it prevents is thoroughly
-    misleading. See
-    [torch reports no CUDA device](#1-torch-reports-no-cuda-device-on-colab) for
-    what goes wrong without it.
+    It should print a table naming the GPU. If it instead complains about
+    `libnvidia-ml.so`, see
+    [torch reports no CUDA device](#1-torch-reports-no-cuda-device-on-colab)
+    before going further.
 
 - Install uv, which is not present by default:
 
@@ -776,7 +776,9 @@ NVIDIA-SMI couldn't find libnvidia-ml.so library in your system.
 ```
 
 **When does this happen?** In a shell opened with `colab ssh`, on a runtime that
-genuinely has a GPU attached.
+genuinely has a GPU attached. Runtimes in September 2026 did this every time;
+by October they put the driver on the path themselves, so it is unlikely now
+but worth recognising if it returns.
 
 **Symptoms:** every CUDA package is installed, `/dev/nvidia0` exists, and
 `torch.cuda.is_available()` still returns `False`. Re-running `uv sync --extra
