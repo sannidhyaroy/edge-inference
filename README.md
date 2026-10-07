@@ -449,7 +449,7 @@ are committed.
 
 `--runtime onnxruntime` runs the stage graphs from the two commands above,
 which is how the model would be deployed. `--runtime pytorch`, the default,
-runs the checkpoint directly and is about 1.6x slower at 2 threads. Both share
+runs the checkpoint directly and is about 1.7x slower at 2 threads. Both share
 one timing loop, so the difference between their profiles is the runtime
 rather than the harness. INT8 is profiled through ONNX Runtime only.
 
@@ -733,25 +733,26 @@ it. Both are worth doing, but they are not the same size of lever.
 Two early-exit models, trained with equal loss weights on all three exits and
 with weights 0.3, 0.3 and 1. Accuracy at each exit, and median time to reach it
 through ONNX Runtime at 2 threads. Times are the equal-weights model's; the
-architecture is identical, and the weighted model is within 0.3 ms at every
+architecture is identical, and the weighted model is within 0.1 ms at every
 exit:
 
 | exit     | `c` MMAC | `a`, 1,1,1 | `a`, 0.3,0.3,1 | float32 ms | INT8 ms |
 | -------- | -------: | ---------: | -------------: | ---------: | ------: |
-| `layer2` |    505.9 |     62.11% |         49.81% |       5.03 |    3.08 |
-| `layer3` |    715.6 |     80.48% |         70.65% |       7.25 |    4.29 |
-| `layer4` |    925.3 |     95.44% |         96.89% |       9.94 |    5.68 |
+| `layer2` |    505.9 |     62.11% |         49.81% |       4.58 |    2.71 |
+| `layer3` |    715.6 |     80.48% |         70.65% |       6.60 |    3.81 |
+| `layer4` |    925.3 |     95.44% |         96.89% |       9.11 |    5.10 |
 
 **The first exit already costs 54.7% of the network**, so early exit can save
-at most 45% of the operations. ResNet does most of its work early.
+at most 45% of the operations. ResNet's four stages cost roughly the same, and
+the first exit comes after the stem and two of them.
 
 **Stopping on confidence cuts the mean, not the tail.** With a 0.55 threshold
 the equal-weights model keeps 94.14% accuracy while its mean latency falls
-19%, but p95 falls only 3%. Images that still run to the final exit set the
+20%, but p95 falls only 2.5%. Images that still run to the final exit set the
 tail, and a deadline cares about the tail.
 
 **INT8 was the larger lever.** The weighted model in INT8, with no early exit,
-reaches 96.46% at 6.02 ms mean. Every float32 early-exit configuration above
+reaches 96.46% at 5.12 ms mean. Every float32 early-exit configuration above
 72% accuracy is slower on average. INT8 also shifts which exit images take,
 sending about one in ten to a deeper exit at the same threshold.
 

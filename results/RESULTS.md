@@ -170,23 +170,35 @@ Why is not yet established.
 ## 7. Latency at every exit
 
 Median time to reach each exit, equal-weights model, 2 threads, all 3925
-images, on AC power:
+images, on AC power. The ONNX Runtime runs started from a CPU cooled to 60 C and
+record its clock and temperature on every row; under this sustained load the
+busy cores settle near 4.05 GHz:
 
 | exit     | PyTorch ms | ONNX Runtime ms | ONNX Runtime INT8 ms |
 | -------- | ---------: | --------------: | -------------------: |
-| `layer2` |       7.16 |            5.03 |                 3.08 |
-| `layer3` |      10.02 |            7.25 |                 4.29 |
-| `layer4` |      15.46 |            9.94 |                 5.68 |
+| `layer2` |       7.16 |            4.58 |                 2.71 |
+| `layer3` |      10.02 |            6.60 |                 3.81 |
+| `layer4` |      15.46 |            9.11 |                 5.10 |
 
 The ONNX Runtime figures are the deployed path: each stage is its own graph,
 and the exit decision happens between graphs.
 
-**Time tracks operations roughly, not exactly.** The first exit takes 50.5% of
+> [!NOTE]
+> These replace ONNX Runtime figures first recorded with one thread pool per
+> stage. A pool's threads keep spinning briefly after a run, so each stage
+> competed with the previous stage's idle threads and every early-exit timing
+> came out inflated. The stages now share one pool, which brings them within 3%
+> of the same network exported as a single graph. With that fix and each run
+> starting cool, the final exit went from 9.94 to 9.11 ms. Accuracy and
+> confidence were never affected.
+
+**Time tracks operations roughly, not exactly.** The first exit takes 50.3% of
 the full float32 time for 54.7% of the operations.
 
-**ONNX Runtime's lead over PyTorch shrinks at fewer threads**: 1.56x here at 2
-threads, against 3.16x at 6 threads in section 4. INT8 adds a further 1.75x,
-consistent with the 1.76x measured on the plain model.
+**ONNX Runtime's lead over PyTorch shrinks at fewer threads**: 1.70x here at 2
+threads, against 3.16x at 6 threads in section 4. The PyTorch profile predates
+the cool-down and clock recording, so treat that ratio as approximate. INT8 adds
+a further 1.79x, close to the 1.76x measured on the plain model.
 
 ---
 
@@ -198,14 +210,14 @@ equal-weights model:
 
 | threshold          | float32 accuracy | mean ms | p95 ms | INT8 accuracy | mean ms | p95 ms |
 | ------------------ | ---------------: | ------: | -----: | ------------: | ------: | -----: |
-| 0.30               |           83.16% |    6.87 |   9.99 |        80.66% |    4.08 |   5.85 |
-| 0.45               |           91.95% |    7.76 |  10.52 |        89.45% |    4.59 |   6.01 |
-| 0.55               |           94.14% |    8.17 |  10.62 |        92.00% |    4.84 |   6.06 |
-| 0.75               |           95.36% |    8.97 |  10.76 |        93.68% |    5.28 |   6.13 |
-| none, final exit   |           95.44% |   10.12 |  10.94 |        93.81% |    5.74 |   6.19 |
+| 0.30               |           83.16% |    6.15 |   9.16 |        80.66% |    3.64 |   5.12 |
+| 0.45               |           91.95% |    6.95 |   9.29 |        89.45% |    4.10 |   5.29 |
+| 0.55               |           94.14% |    7.33 |   9.36 |        92.00% |    4.33 |   5.35 |
+| 0.75               |           95.36% |    8.06 |   9.48 |        93.68% |    4.73 |   5.43 |
+| none, final exit   |           95.44% |    9.11 |   9.60 |        93.81% |    5.15 |   5.49 |
 
 **Stopping on confidence cuts the mean, not the tail.** At 0.55 the float32
-mean falls 19%, from 10.12 to 8.17 ms, while p95 falls 3%. The images that
+mean falls 20%, from 9.11 to 7.33 ms, while p95 falls 2.5%. The images that
 still run to the final exit set the tail, and under a deadline the tail is what
 decides whether a task completes. Capping latency needs the exit chosen from
 the time remaining, as a state-driven controller does.
@@ -214,17 +226,17 @@ the time remaining, as a state-driven controller does.
 of images to a different exit: 10.6% go deeper, mostly from the second exit to
 the third, and 2.6% stop earlier. The second exit's mean confidence drops from
 0.62 to 0.57, so fewer images clear the threshold there, and the mean saving
-from early exit shrinks from 19% to 16%.
+from early exit shrinks from 20% to 16%.
 
 **The weighted run's exits barely fire.** At 0.55 only 2.3% of its images stop
 at the first exit and 1.6% at the second, because its heads are so
 underconfident. Confidence thresholds give it almost nothing.
 
 **INT8 was the larger lever.** The weighted run in INT8, with no early exit at
-all, reaches 96.46% at 6.02 ms mean and 6.57 ms p95. Every float32 early-exit
+all, reaches 96.46% at 5.12 ms mean and 5.45 ms p95. Every float32 early-exit
 configuration of either model above 72% accuracy is slower on average. The
 only configurations more accurate are the weighted run's own float32 ones, by
-at most 0.43 points, at 1.7x the latency. Early exit still matters where the
+at most 0.43 points, at 1.8x the latency. Early exit still matters where the
 exit is chosen for a deadline or an offloading decision rather than by
 confidence, which is the setting the next measurements address.
 
