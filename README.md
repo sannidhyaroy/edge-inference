@@ -728,6 +728,36 @@ For an edge deployment this says something the accuracy tables do not: choosing
 the execution runtime can outweigh the model optimization technique applied to
 it. Both are worth doing, but they are not the same size of lever.
 
+### Early exit
+
+Two early-exit models, trained with equal loss weights on all three exits and
+with weights 0.3, 0.3 and 1. Accuracy at each exit, and median time to reach it
+through ONNX Runtime at 2 threads. Times are the equal-weights model's; the
+architecture is identical, and the weighted model is within 0.3 ms at every
+exit:
+
+| exit     | `c` MMAC | `a`, 1,1,1 | `a`, 0.3,0.3,1 | float32 ms | INT8 ms |
+| -------- | -------: | ---------: | -------------: | ---------: | ------: |
+| `layer2` |    505.9 |     62.11% |         49.81% |       5.03 |    3.08 |
+| `layer3` |    715.6 |     80.48% |         70.65% |       7.25 |    4.29 |
+| `layer4` |    925.3 |     95.44% |         96.89% |       9.94 |    5.68 |
+
+**The first exit already costs 54.7% of the network**, so early exit can save
+at most 45% of the operations. ResNet does most of its work early.
+
+**Stopping on confidence cuts the mean, not the tail.** With a 0.55 threshold
+the equal-weights model keeps 94.14% accuracy while its mean latency falls
+19%, but p95 falls only 3%. Images that still run to the final exit set the
+tail, and a deadline cares about the tail.
+
+**INT8 was the larger lever.** The weighted model in INT8, with no early exit,
+reaches 96.46% at 6.02 ms mean. Every float32 early-exit configuration above
+72% accuracy is slower on average. INT8 also shifts which exit images take,
+sending about one in ten to a deeper exit at the same threshold.
+
+The full breakdown, including INT8 accuracy at every exit, is in
+[`results/RESULTS.md`](results/RESULTS.md).
+
 ---
 
 ## Troubleshooting

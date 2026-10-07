@@ -116,6 +116,120 @@ deserves the same scrutiny as model optimization, and gets less of it.
 
 ---
 
+## 5. Early exit: the `c` and `a` vectors
+
+Exit heads after `layer2` and `layer3`, trained jointly with the final exit on
+a T4 for 8 epochs. Two runs, differing only in how the loss weights the three
+exits:
+
+| exit     |   `c` MMAC | share of network | `a`, weights 1,1,1 | `a`, weights 0.3,0.3,1 |
+| -------- | ---------: | ---------------: | -----------------: | ---------------------: |
+| `layer2` |      505.9 |            54.7% |             62.11% |                 49.81% |
+| `layer3` |      715.6 |            77.3% |             80.48% |                 70.65% |
+| `layer4` |      925.3 |             100% |             95.44% |                 96.89% |
+
+**ResNet front-loads its compute.** The first exit already costs 54.7% of the
+network, so no stopping rule can save more than 45% of the operations, however
+easy the inputs.
+
+**Equal weights cost the final exit 1.45 points.** The exits share the network
+body, and weak early heads pull it toward themselves. Weighting the final exit
+more restores it exactly to the plain model's 96.89%, at a cost of 12.30 and
+9.83 points at the early exits. Neither run dominates the other, so both are
+carried through every measurement below.
+
+**The early heads are underconfident.** Mean top probability at the first exit
+is 0.32 at 62% accuracy with equal weights, and 0.16 at 50% with the weighted
+run. A confidence threshold calibrated by intuition would almost never let them
+answer, which is why the sweep in section 8 starts at 0.10.
+
+---
+
+## 6. INT8 at every exit
+
+Each stage quantized separately and evaluated chained, as deployed, on all 3925
+validation images. INT8 MiB is the weights a device stopping at that exit must
+hold:
+
+| exit     | 1,1,1 float32 | 1,1,1 INT8 |  drop | 0.3 float32 | 0.3 INT8 |  drop | INT8 MiB |
+| -------- | ------------: | ---------: | ----: | ----------: | -------: | ----: | -------: |
+| `layer2` |        62.11% |     56.79% |  5.32 |      49.81% |   47.95% |  1.86 |     0.72 |
+| `layer3` |        80.48% |     78.11% |  2.37 |      70.65% |   68.69% |  1.96 |     2.77 |
+| `layer4` |        95.44% |     93.81% |  1.63 |      96.89% |   96.46% |  0.43 |    10.85 |
+
+**Quantizing stage by stage costs nothing.** The weighted run's final exit
+loses 0.43 points, against 0.48 for the plain model quantized whole.
+
+**The equal-weights model is far more sensitive to INT8**, losing 5.32 points
+at its first exit. Both models went through the same stages and the same
+calibration, so the difference lies in the trained weights, not the method.
+Why is not yet established.
+
+---
+
+## 7. Latency at every exit
+
+Median time to reach each exit, equal-weights model, 2 threads, all 3925
+images, on AC power:
+
+| exit     | PyTorch ms | ONNX Runtime ms | ONNX Runtime INT8 ms |
+| -------- | ---------: | --------------: | -------------------: |
+| `layer2` |       7.16 |            5.03 |                 3.08 |
+| `layer3` |      10.02 |            7.25 |                 4.29 |
+| `layer4` |      15.46 |            9.94 |                 5.68 |
+
+The ONNX Runtime figures are the deployed path: each stage is its own graph,
+and the exit decision happens between graphs.
+
+**Time tracks operations roughly, not exactly.** The first exit takes 50.5% of
+the full float32 time for 54.7% of the operations.
+
+**ONNX Runtime's lead over PyTorch shrinks at fewer threads**: 1.56x here at 2
+threads, against 3.16x at 6 threads in section 4. INT8 adds a further 1.75x,
+consistent with the 1.76x measured on the plain model.
+
+---
+
+## 8. Confidence thresholds
+
+Each image stops at the first exit whose top probability reaches the threshold,
+and the final exit always answers. Applied to the ONNX Runtime profiles of the
+equal-weights model:
+
+| threshold          | float32 accuracy | mean ms | p95 ms | INT8 accuracy | mean ms | p95 ms |
+| ------------------ | ---------------: | ------: | -----: | ------------: | ------: | -----: |
+| 0.30               |           83.16% |    6.87 |   9.99 |        80.66% |    4.08 |   5.85 |
+| 0.45               |           91.95% |    7.76 |  10.52 |        89.45% |    4.59 |   6.01 |
+| 0.55               |           94.14% |    8.17 |  10.62 |        92.00% |    4.84 |   6.06 |
+| 0.75               |           95.36% |    8.97 |  10.76 |        93.68% |    5.28 |   6.13 |
+| none, final exit   |           95.44% |   10.12 |  10.94 |        93.81% |    5.74 |   6.19 |
+
+**Stopping on confidence cuts the mean, not the tail.** At 0.55 the float32
+mean falls 19%, from 10.12 to 8.17 ms, while p95 falls 3%. The images that
+still run to the final exit set the tail, and under a deadline the tail is what
+decides whether a task completes. Capping latency needs the exit chosen from
+the time remaining, as a state-driven controller does.
+
+**Quantization changes which exit an image takes.** At 0.55, INT8 moves 13.1%
+of images to a different exit: 10.6% go deeper, mostly from the second exit to
+the third, and 2.6% stop earlier. The second exit's mean confidence drops from
+0.62 to 0.57, so fewer images clear the threshold there, and the mean saving
+from early exit shrinks from 19% to 16%.
+
+**The weighted run's exits barely fire.** At 0.55 only 2.3% of its images stop
+at the first exit and 1.6% at the second, because its heads are so
+underconfident. Confidence thresholds give it almost nothing.
+
+**INT8 was the larger lever.** The weighted run in INT8, with no early exit at
+all, reaches 96.46% at 6.02 ms mean and 6.57 ms p95. Every float32 early-exit
+configuration of either model above 72% accuracy is slower on average. The
+only configurations more accurate are the weighted run's own float32 ones, by
+at most 0.43 points, at 1.7x the latency. Early exit still matters where the
+exit is chosen for a deadline or an offloading decision rather than by
+confidence, which is the setting the next measurements address.
+
+---
+
 ## What these numbers are not
 
 **The reference machine is a laptop, not an edge board.** It stands in for one,
@@ -136,11 +250,7 @@ compared by accident.
 
 ## Next
 
-Early exit. Intermediate classifiers after `layer2` and `layer3`, trained
-jointly, giving per-exit accuracy and cumulative operations. Those two vectors
-are what the Angelucci et al. controller treats the network as, and producing
-them from real measurements is the point of this project.
-
-After that, the two techniques combined: whether INT8 quantization shifts
-*which* exit an image takes, by perturbing the confidence scores the exit
-criterion depends on.
+Offloading. Every result above is local inference. Next comes the time to run
+the same stages on a server, the size of what would cross the network at each
+split point, and a simulated wireless link, so local, split and offloaded
+inference can be compared per image on the same footing.
