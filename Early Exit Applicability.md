@@ -83,14 +83,15 @@ escape hatch.
 
 ## What our own measurements suggest
 
-Three findings bear on where this technique belongs.
+Four findings bear on where this technique belongs.
 
 **Six threads beat twelve**, and the reason was tail latency rather than the
 median. That makes the next finding matter: **confidence-based early exit cuts
-the mean far more than the tail.** On our equal-weights model, stopping at the
-first exit with top probability 0.55 or more cuts mean latency 23%, from 15.65
-to 12.00 ms, but p95 only from 17.54 to 16.50 ms. While a sizeable share of
-images still runs to the final exit, those runs keep setting the tail.
+the mean far more than the tail.** On our equal-weights model under ONNX
+Runtime, stopping at the first exit with top probability 0.55 or more cuts mean
+latency 19%, from 10.12 to 8.17 ms, but p95 only from 10.94 to 10.62 ms. While
+a sizeable share of images still runs to the final exit, those runs keep
+setting the tail.
 
 Under a hard deadline it is the tail that decides whether a task completes, so
 letting each image choose its own exit does little for deadlines on its own.
@@ -109,6 +110,15 @@ too, but adaptively rather than uniformly: the loss is concentrated on inputs
 the network finds hard, whereas quantization degrades every input a little.
 Those are different shapes of trade, and which is preferable depends on whether
 the application tolerates occasional larger errors or uniform smaller ones.
+
+**On this model, INT8 beat confidence-based early exit outright.** A ResNet-18
+in INT8 with no early exit reaches 96.46% at 6.02 ms mean, and every float32
+early-exit configuration above 72% accuracy is slower on average. Combining the
+two also erodes early exit's share: quantization lowers the exits' confidence,
+sending about one image in ten to a deeper exit at the same threshold, and the
+mean saving falls from 19% to 16%. What is left for early exit on a network
+like this is the case a confidence threshold does not cover, choosing a cheaper
+exit because the deadline or the network link demands it.
 
 ---
 
