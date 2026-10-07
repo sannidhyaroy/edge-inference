@@ -22,7 +22,7 @@ from edge_inference.config import (
     RESULTS_DIR,
     seed_everything,
 )
-from edge_inference.data import build_dataloader, load_split
+from edge_inference.data import build_dataloader, image_files, load_split
 from edge_inference.exit_analysis import default_thresholds, exit_vectors, sweep_thresholds
 from edge_inference.exit_profiler import profile_exit_sessions, profile_exits
 from edge_inference.export import (
@@ -49,6 +49,7 @@ from edge_inference.quantization import (
     quantize_exit_stages,
     quantize_onnx,
 )
+from edge_inference.split import profile_splits
 from edge_inference.training import fine_tune
 
 console = Console()
@@ -649,6 +650,78 @@ def cmd_exits_quantize(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_split_profile(args: argparse.Namespace) -> int:
+    """Payload size, preparation time and 8-bit accuracy at every split point."""
+    seed_everything()
+
+    checkpoint = Path(args.checkpoint)
+    suffix = ".onnx" if args.precision == "float32" else f".{args.precision}.onnx"
+    paths = stage_paths(checkpoint.with_suffix(""), suffix=suffix)
+    missing = [path for path in paths if not path.exists()]
+    if missing:
+        command = "export" if args.precision == "float32" else "quantize"
+        console.print(
+            f"[bold red]No stage graph at {missing[0]}.[/bold red] Run `edge exits {command}` first."
+        )
+        return 1
+
+    dataset = load_split("val", root=Path(args.root))
+    count = len(dataset) if args.limit is None else min(args.limit, len(dataset))
+    console.print(
+        f"Profiling payloads for {count} images at every split point, "
+        f"{args.precision} stages, {args.threads} thread(s)"
+    )
+    rows = profile_splits(
+        [build_session(path, threads=args.threads) for path in paths],
+        dataset,
+        threads=args.threads,
+        warmup=args.warmup,
+        precision=args.precision,
+        files=image_files(dataset),
+        limit=args.limit,
+        level=args.level,
+    )
+    frame = pd.DataFrame(rows)
+
+    # Decimal kilobytes, the unit network bandwidth is quoted in.
+    kb = 1000
+    table = Table(title=f"What crosses the network, median of {count} images")
+    for column in (
+        "split after",
+        "float32 KB",
+        "+ zstd",
+        "uint8 KB",
+        "+ zstd",
+        "zstd ms",
+        "accuracy",
+        "uint8 accuracy",
+    ):
+        table.add_column(column, justify="right")
+    for name, group in frame.groupby("split_name", sort=False):
+        table.add_row(
+            str(name),
+            f"{group['float32_bytes'].median() / kb:.1f}",
+            f"{group['float32_zstd_bytes'].median() / kb:.1f}",
+            f"{group['uint8_bytes'].median() / kb:.1f}",
+            f"{group['uint8_zstd_bytes'].median() / kb:.1f}",
+            f"{(group['uint8_quantize_ms'] + group['uint8_zstd_ms']).median():.2f}",
+            f"{group['correct'].mean() * 100:.2f}%",
+            f"{group['correct_uint8'].mean() * 100:.2f}%",
+        )
+    console.print(table)
+    jpeg = frame.drop_duplicates("image")["jpeg_bytes"]
+    console.print(
+        f"Full offload sends the JPEG instead: median [bold]{jpeg.median() / kb:.1f} KB[/bold]"
+    )
+
+    default_name = f"split_profile_{checkpoint.stem}_{args.precision}_t{args.threads}.csv.gz"
+    out = Path(args.out or RESULTS_DIR / default_name)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(out, index=False)
+    console.print(f"Wrote [bold]{out}[/bold] ({len(frame)} rows)")
+    return 0
+
+
 def cmd_exits_sweep(args: argparse.Namespace) -> int:
     """Exit vectors and a confidence-threshold sweep from a recorded profile."""
     profile = Path(args.profile)
@@ -959,6 +1032,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     exits_sweep.add_argument("profile", help="CSV written by `edge exits profile`")
     exits_sweep.set_defaults(func=cmd_exits_sweep)
+
+    split = subparsers.add_parser("split", help="split computing payloads")
+    split_sub = split.add_subparsers(dest="split_command", required=True)
+    split_profile = split_sub.add_parser(
+        "profile", help="payload size, preparation time and 8-bit accuracy at every split point"
+    )
+    split_profile.add_argument("--root", default=str(DATA_DIR), help="dataset directory")
+    split_profile.add_argument(
+        "--checkpoint",
+        default=str(CHECKPOINT_DIR / "resnet18_early_exit_imagenette.pt"),
+        help="the stage graphs exported beside it are what the device runs",
+    )
+    split_profile.add_argument(
+        "--precision",
+        default="float32",
+        choices=("float32", "int8"),
+        help="precision of the device's stage graphs",
+    )
+    split_profile.add_argument("--threads", type=int, default=2, help="pinned thread count")
+    split_profile.add_argument("--warmup", type=int, default=10, help="discarded runs first")
+    split_profile.add_argument("--level", type=int, default=3, help="zstd compression level")
+    split_profile.add_argument(
+        "--limit", type=int, default=None, help="profile a seeded random sample of N images"
+    )
+    split_profile.add_argument(
+        "--out", default=None, help="default names the checkpoint, precision and thread count"
+    )
+    split_profile.set_defaults(func=cmd_split_profile)
 
     bench = subparsers.add_parser("bench", help="measure forward pass latency")
     bench.add_argument("--backbone", default="resnet18", choices=SUPPORTED_BACKBONES)

@@ -104,6 +104,18 @@ def load_split(
         )
 
 
+def image_files(dataset: Imagenette) -> list[Path]:
+    """The source file of every image, in dataset index order.
+
+    Full offload sends the image file as the device stored it, so its size on
+    disk is the payload. torchvision keeps the paths in a private `_samples`
+    list with no public accessor, so they are read in this one place: if
+    torchvision renames it, this fails loudly here rather than somewhere
+    downstream.
+    """
+    return [Path(path) for path, _ in dataset._samples]
+
+
 def build_dataloader(
     dataset: Imagenette,
     *,
