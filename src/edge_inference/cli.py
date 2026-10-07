@@ -13,7 +13,12 @@ import torch
 from rich.console import Console
 from rich.table import Table
 
-from edge_inference.bench import benchmark_model, benchmark_session, resolve_device
+from edge_inference.bench import (
+    benchmark_model,
+    benchmark_session,
+    resolve_device,
+    set_thread_count,
+)
 from edge_inference.config import (
     CHECKPOINT_DIR,
     DATA_DIR,
@@ -50,6 +55,7 @@ from edge_inference.quantization import (
     quantize_exit_stages,
     quantize_onnx,
 )
+from edge_inference.server import OnnxServer, TorchServer, profile_server
 from edge_inference.split import profile_splits
 from edge_inference.training import fine_tune
 
@@ -723,6 +729,78 @@ def cmd_split_profile(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_server_profile(args: argparse.Namespace) -> int:
+    """Receive and compute time on the server for every way a frame can arrive."""
+    seed_everything()
+    checkpoint = Path(args.checkpoint)
+    if not checkpoint.exists():
+        console.print(f"[bold red]No checkpoint at {checkpoint}.[/bold red]")
+        return 1
+
+    # Pinned for both runtimes: JPEG preprocessing runs on PyTorch's pool even
+    # when ONNX Runtime does the inference.
+    threads = set_thread_count(args.threads)
+    if args.runtime == "pytorch":
+        device = resolve_device(args.device)
+        model = build_early_exit(args.backbone, num_classes=NUM_CLASSES)
+        load_checkpoint(model, checkpoint)
+        server = TorchServer(model, device)
+        accelerator = torch.cuda.get_device_name(0) if device.startswith("cuda") else None
+        labels = {"runtime": "pytorch", "precision": "float32", "device": device}
+    else:
+        suffix = ".onnx" if args.precision == "float32" else f".{args.precision}.onnx"
+        paths = stage_paths(checkpoint.with_suffix(""), suffix=suffix)
+        missing = [path for path in paths if not path.exists()]
+        if missing:
+            console.print(f"[bold red]No stage graph at {missing[0]}.[/bold red]")
+            return 1
+        server = OnnxServer(build_stage_sessions(paths, threads=threads))
+        accelerator = None
+        labels = {"runtime": "onnxruntime", "precision": args.precision, "device": "cpu"}
+    labels |= {"accelerator": accelerator, "threads": threads}
+
+    dataset = load_split("val", root=Path(args.root))
+    count = len(dataset) if args.limit is None else min(args.limit, len(dataset))
+    target = accelerator or f"{threads} CPU thread(s)"
+    console.print(f"Profiling the server side of {count} images on {target}, {args.runtime}")
+    rows = profile_server(
+        server,
+        dataset,
+        image_files(dataset),
+        warmup=args.warmup,
+        labels=labels,
+        limit=args.limit,
+        level=args.level,
+    )
+    frame = pd.DataFrame(rows)
+
+    table = Table(title=f"Server time per frame, median of {count} images, on {target}")
+    for column in ("arrives as", "receive ms", "compute ms", "total ms", "p95 ms", "accuracy"):
+        table.add_column(column, justify="right")
+    keys = ["mode", "split_name", "payload"]
+    for (mode, split_name, payload), group in frame.groupby(keys, sort=False, dropna=False):
+        arrives = "JPEG" if mode == "offload" else f"{payload} after {split_name}"
+        table.add_row(
+            arrives,
+            f"{group['receive_ms'].median():.2f}",
+            f"{group['compute_ms'].median():.2f}",
+            f"{group['total_ms'].median():.2f}",
+            f"{group['total_ms'].quantile(0.95):.2f}",
+            f"{group['correct'].mean() * 100:.2f}%",
+        )
+    console.print(table)
+
+    where = "cuda" if accelerator else f"t{threads}"
+    default_name = (
+        f"server_profile_{checkpoint.stem}_{args.runtime}_{labels['precision']}_{where}.csv.gz"
+    )
+    out = Path(args.out or RESULTS_DIR / default_name)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(out, index=False)
+    console.print(f"Wrote [bold]{out}[/bold] ({len(frame)} rows)")
+    return 0
+
+
 def cmd_exits_sweep(args: argparse.Namespace) -> int:
     """Exit vectors and a confidence-threshold sweep from a recorded profile."""
     profile = Path(args.profile)
@@ -1061,6 +1139,44 @@ def build_parser() -> argparse.ArgumentParser:
         "--out", default=None, help="default names the checkpoint, precision and thread count"
     )
     split_profile.set_defaults(func=cmd_split_profile)
+
+    server = subparsers.add_parser("server", help="server-side profiling")
+    server_sub = server.add_subparsers(dest="server_command", required=True)
+    server_profile = server_sub.add_parser(
+        "profile", help="receive and compute time for every way a frame can arrive"
+    )
+    server_profile.add_argument("--backbone", default="resnet18", choices=SUPPORTED_BACKBONES)
+    server_profile.add_argument("--root", default=str(DATA_DIR), help="dataset directory")
+    server_profile.add_argument(
+        "--checkpoint", default=str(CHECKPOINT_DIR / "resnet18_early_exit_imagenette.pt")
+    )
+    server_profile.add_argument(
+        "--runtime",
+        default="pytorch",
+        choices=("pytorch", "onnxruntime"),
+        help="pytorch for a GPU server, onnxruntime for a CPU server",
+    )
+    server_profile.add_argument(
+        "--device", default="cuda", help="pytorch only: cuda for a GPU server, or cpu"
+    )
+    server_profile.add_argument(
+        "--precision",
+        default="float32",
+        choices=("float32", "int8"),
+        help="onnxruntime only: precision of the stage graphs",
+    )
+    server_profile.add_argument(
+        "--threads", type=int, default=6, help="CPU threads, for a CPU server or JPEG decoding"
+    )
+    server_profile.add_argument("--warmup", type=int, default=10, help="discarded runs first")
+    server_profile.add_argument("--level", type=int, default=3, help="zstd compression level")
+    server_profile.add_argument(
+        "--limit", type=int, default=None, help="profile a seeded random sample of N images"
+    )
+    server_profile.add_argument(
+        "--out", default=None, help="default names the checkpoint, runtime and hardware"
+    )
+    server_profile.set_defaults(func=cmd_server_profile)
 
     bench = subparsers.add_parser("bench", help="measure forward pass latency")
     bench.add_argument("--backbone", default="resnet18", choices=SUPPORTED_BACKBONES)
