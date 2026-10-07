@@ -20,7 +20,11 @@ they are what decides where an early-exit network stops.
 import math
 import random
 import time
+from collections.abc import Callable, Sequence
+from typing import Any
 
+import numpy as np
+import onnxruntime as ort
 import torch
 from torch.utils.data import Dataset
 
@@ -32,7 +36,13 @@ from edge_inference.bench import (
     set_thread_count,
 )
 from edge_inference.config import SEED
+from edge_inference.export import FEATURES_NAME, OUTPUT_NAME, run_stage
 from edge_inference.models import EXIT_NAMES, EarlyExitResNet
+
+# One exit's work: take the previous stage's output, run the next stage and its
+# head, and return (features for the next stage, probabilities, confidence,
+# predicted class). Everything inside it is what gets timed.
+ExitStep = Callable[[int, Any], tuple[Any, Any, float, int]]
 
 
 def entropy(probabilities: torch.Tensor) -> float:
@@ -68,6 +78,82 @@ def profile_exits(
     """
     effective_threads = set_thread_count(threads)
     model = model.to(device).eval()
+
+    def step(exit_index: int, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, float, int]:
+        x = model.stages[exit_index](x)
+        probabilities = model.heads[exit_index](x).softmax(dim=1)[0]
+        confidence, predicted = probabilities.max(dim=0)
+        return x, probabilities, float(confidence), int(predicted)
+
+    with torch.inference_mode():
+        return _profile(
+            step,
+            lambda image: image.unsqueeze(0).to(device),
+            dataset,
+            warmup=warmup,
+            macs_per_exit=macs_per_exit,
+            limit=limit,
+            labels={
+                "precision": "float32",
+                "runtime": "pytorch",
+                "device": device,
+                "threads": effective_threads,
+            },
+        )
+
+
+def profile_exit_sessions(
+    sessions: Sequence[ort.InferenceSession],
+    dataset: Dataset,
+    *,
+    threads: int,
+    warmup: int,
+    macs_per_exit: list[float],
+    precision: str,
+    limit: int | None = None,
+) -> list[dict[str, object]]:
+    """The same profile as `profile_exits`, through chained ONNX Runtime stages.
+
+    This is the deployed path: each stage is its own graph, and the exit
+    decision happens in the application between them. `threads` must be what
+    the sessions were built with; ONNX Runtime cannot report it back.
+    """
+
+    def step(exit_index: int, x: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, int]:
+        outputs = run_stage(sessions[exit_index], x)
+        logits = outputs[OUTPUT_NAME][0]
+        exponentials = np.exp(logits - logits.max())
+        probabilities = exponentials / exponentials.sum()
+        predicted = int(probabilities.argmax())
+        return outputs.get(FEATURES_NAME), probabilities, float(probabilities[predicted]), predicted
+
+    return _profile(
+        step,
+        lambda image: image.unsqueeze(0).numpy(),
+        dataset,
+        warmup=warmup,
+        macs_per_exit=macs_per_exit,
+        limit=limit,
+        labels={
+            "precision": precision,
+            "runtime": "onnxruntime",
+            "device": "cpu",
+            "threads": threads,
+        },
+    )
+
+
+def _profile(
+    step: ExitStep,
+    prepare: Callable[[torch.Tensor], Any],
+    dataset: Dataset,
+    *,
+    warmup: int,
+    macs_per_exit: list[float],
+    limit: int | None,
+    labels: dict[str, object],
+) -> list[dict[str, object]]:
+    """Time every exit for every image, whichever runtime `step` uses."""
     machine = machine_model()
     cpu = cpu_model()
     # Read once at the start. Power and frequency policy decide latency by large
@@ -81,49 +167,45 @@ def profile_exits(
     if limit is not None and limit < len(indices):
         indices = sorted(random.Random(SEED).sample(indices, limit))
 
-    with torch.inference_mode():
-        # Warm up on the first image so allocator growth and kernel selection
-        # are paid before anything is timed, as in the benchmark harness.
-        first, _ = dataset[0]
-        for _ in range(warmup):
-            model(first.unsqueeze(0).to(device))
+    # Warm up on the first image so allocator growth and kernel selection are
+    # paid before anything is timed, as in the benchmark harness.
+    first, _ = dataset[0]
+    for _ in range(warmup):
+        x = prepare(first)
+        for exit_index in range(len(EXIT_NAMES)):
+            x, *_ = step(exit_index, x)
 
-        rows: list[dict[str, object]] = []
-        for index in indices:
-            image, label = dataset[index]
-            x = image.unsqueeze(0).to(device)
-            cumulative_ms = 0.0
+    rows: list[dict[str, object]] = []
+    for index in indices:
+        image, label = dataset[index]
+        x = prepare(image)
+        cumulative_ms = 0.0
 
-            for exit_index, (stage, head) in enumerate(zip(model.stages, model.heads, strict=True)):
-                start = time.perf_counter()
-                x = stage(x)
-                probabilities = head(x).softmax(dim=1)[0]
-                confidence, predicted = probabilities.max(dim=0)
-                step_ms = (time.perf_counter() - start) * 1000.0
-                cumulative_ms += step_ms
+        for exit_index, exit_name in enumerate(EXIT_NAMES):
+            start = time.perf_counter()
+            x, probabilities, confidence, predicted = step(exit_index, x)
+            step_ms = (time.perf_counter() - start) * 1000.0
+            cumulative_ms += step_ms
 
-                rows.append(
-                    {
-                        "image": index,
-                        "label": int(label),
-                        "exit": exit_index + 1,
-                        "exit_name": EXIT_NAMES[exit_index],
-                        "step_ms": step_ms,
-                        "cumulative_ms": cumulative_ms,
-                        "mmacs": macs_per_exit[exit_index] / 1e6,
-                        "confidence": float(confidence),
-                        "entropy": entropy(probabilities),
-                        "predicted": int(predicted),
-                        "correct": int(predicted) == int(label),
-                        "precision": "float32",
-                        "runtime": "pytorch",
-                        "device": device,
-                        "threads": effective_threads,
-                        "machine": machine,
-                        "cpu": cpu,
-                        **conditions,
-                    }
-                )
+            rows.append(
+                {
+                    "image": index,
+                    "label": int(label),
+                    "exit": exit_index + 1,
+                    "exit_name": exit_name,
+                    "step_ms": step_ms,
+                    "cumulative_ms": cumulative_ms,
+                    "mmacs": macs_per_exit[exit_index] / 1e6,
+                    "confidence": confidence,
+                    "entropy": entropy(torch.as_tensor(probabilities)),
+                    "predicted": predicted,
+                    "correct": predicted == int(label),
+                    **labels,
+                    "machine": machine,
+                    "cpu": cpu,
+                    **conditions,
+                }
+            )
 
     return rows
 

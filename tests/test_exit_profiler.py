@@ -64,3 +64,33 @@ def test_limit_samples_across_the_dataset():
     sampled = {row["image"] for row in rows}
     assert len(sampled) == 8
     assert len({row["label"] for row in rows}) > 1
+
+
+def test_onnx_runtime_profile_agrees_with_pytorch(tmp_path):
+    """Both runtimes must record the same answers for the same images.
+
+    Latency differs between them by design. Predictions must not, since the
+    stage graphs passed parity, so any disagreement means the ONNX Runtime path
+    chains the stages or reads their outputs wrongly.
+    """
+    from edge_inference.exit_profiler import profile_exit_sessions
+    from edge_inference.export import build_session, export_exit_stages
+
+    torch.manual_seed(0)
+    model = build_early_exit(num_classes=NUM_CLASSES)
+    dataset = TensorDataset(torch.randn(3, 3, 32, 32), torch.tensor([0, 1, 2]))
+    macs = [1e6, 2e6, 3e6]
+    paths = export_exit_stages(model, tmp_path / "tiny", image_size=32)
+    sessions = [build_session(path) for path in paths]
+
+    reference = profile_exits(model, dataset, threads=1, warmup=0, macs_per_exit=macs)
+    rows = profile_exit_sessions(
+        sessions, dataset, threads=1, warmup=1, macs_per_exit=macs, precision="float32"
+    )
+
+    assert len(rows) == len(reference)
+    for row, expected in zip(rows, reference, strict=True):
+        assert row["runtime"] == "onnxruntime"
+        assert (row["image"], row["exit_name"]) == (expected["image"], expected["exit_name"])
+        assert row["predicted"] == expected["predicted"]
+        assert math.isclose(row["confidence"], expected["confidence"], abs_tol=1e-4)

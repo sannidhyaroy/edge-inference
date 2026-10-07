@@ -24,7 +24,7 @@ from edge_inference.config import (
 )
 from edge_inference.data import build_dataloader, load_split
 from edge_inference.exit_analysis import default_thresholds, exit_vectors, sweep_thresholds
-from edge_inference.exit_profiler import profile_exits
+from edge_inference.exit_profiler import profile_exit_sessions, profile_exits
 from edge_inference.export import (
     DEFAULT_OPSET,
     build_session,
@@ -427,18 +427,43 @@ def cmd_exits_profile(args: argparse.Namespace) -> int:
     macs = operations_per_exit(model, image_size=IMAGE_SIZE)
     count = len(dataset) if args.limit is None else min(args.limit, len(dataset))
 
+    if args.runtime == "pytorch" and args.precision != "float32":
+        console.print("[bold red]INT8 is profiled through ONNX Runtime only.[/bold red]")
+        return 2
+
     console.print(
-        f"Profiling {count} images at every exit, {args.threads} thread(s), "
-        f"after {args.warmup} warmup runs"
+        f"Profiling {count} images at every exit, {args.runtime} {args.precision}, "
+        f"{args.threads} thread(s), after {args.warmup} warmup runs"
     )
-    rows = profile_exits(
-        model,
-        dataset,
-        threads=args.threads,
-        warmup=args.warmup,
-        macs_per_exit=macs,
-        limit=args.limit,
-    )
+    if args.runtime == "pytorch":
+        rows = profile_exits(
+            model,
+            dataset,
+            threads=args.threads,
+            warmup=args.warmup,
+            macs_per_exit=macs,
+            limit=args.limit,
+        )
+    else:
+        suffix = ".onnx" if args.precision == "float32" else f".{args.precision}.onnx"
+        paths = stage_paths(checkpoint.with_suffix(""), suffix=suffix)
+        missing = [path for path in paths if not path.exists()]
+        if missing:
+            command = "export" if args.precision == "float32" else "quantize"
+            console.print(
+                f"[bold red]No stage graph at {missing[0]}.[/bold red] "
+                f"Run `edge exits {command}` first."
+            )
+            return 1
+        rows = profile_exit_sessions(
+            [build_session(path, threads=args.threads) for path in paths],
+            dataset,
+            threads=args.threads,
+            warmup=args.warmup,
+            macs_per_exit=macs,
+            precision=args.precision,
+            limit=args.limit,
+        )
     frame = pd.DataFrame(rows)
 
     summary = frame.groupby("exit_name", sort=False).agg(
@@ -469,7 +494,9 @@ def cmd_exits_profile(args: argparse.Namespace) -> int:
     # measures a different moment rather than reproducing this one, so they
     # are committed rather than regenerated. Compression cuts them about 5x,
     # and pandas reads .csv.gz directly.
-    default_name = f"exit_profile_{checkpoint.stem}_pytorch_float32_t{args.threads}.csv.gz"
+    default_name = (
+        f"exit_profile_{checkpoint.stem}_{args.runtime}_{args.precision}_t{args.threads}.csv.gz"
+    )
     out = Path(args.out or RESULTS_DIR / default_name)
     out.parent.mkdir(parents=True, exist_ok=True)
     frame.to_csv(out, index=False)
@@ -856,6 +883,18 @@ def build_parser() -> argparse.ArgumentParser:
     exits_profile.add_argument("--root", default=str(DATA_DIR), help="dataset directory")
     exits_profile.add_argument(
         "--checkpoint", default=str(CHECKPOINT_DIR / "resnet18_early_exit_imagenette.pt")
+    )
+    exits_profile.add_argument(
+        "--runtime",
+        default="pytorch",
+        choices=("pytorch", "onnxruntime"),
+        help="onnxruntime runs the stage graphs from `edge exits export`, as deployed",
+    )
+    exits_profile.add_argument(
+        "--precision",
+        default="float32",
+        choices=("float32", "int8"),
+        help="int8 needs `--runtime onnxruntime` and `edge exits quantize`",
     )
     exits_profile.add_argument("--threads", type=int, default=2, help="pinned thread count")
     exits_profile.add_argument("--warmup", type=int, default=10, help="discarded runs first")
