@@ -16,8 +16,10 @@ from rich.table import Table
 from edge_inference.bench import (
     benchmark_model,
     benchmark_session,
+    cpu_state,
     resolve_device,
     set_thread_count,
+    wait_for_cooldown,
 )
 from edge_inference.config import (
     CHECKPOINT_DIR,
@@ -94,6 +96,22 @@ def parse_weight_list(value: str) -> list[float]:
     if not weights or any(w < 0 for w in weights) or sum(weights) == 0:
         raise argparse.ArgumentTypeError("weights must be non-negative and not all zero")
     return weights
+
+
+def cool_down(target_c: float | None) -> None:
+    """Wait for the CPU to cool to `target_c` before a timed run, if one was given."""
+    if target_c is None:
+        return
+    start = cpu_state()["cpu_temp_c"]
+    if start is None:
+        console.print("[yellow]No CPU temperature is readable here; not waiting.[/yellow]")
+        return
+    if start <= target_c:
+        return
+    console.print(f"Waiting for the CPU to cool from {start:.0f} C to {target_c:.0f} C")
+    reached = wait_for_cooldown(target_c)
+    if reached is not None and reached > target_c:
+        console.print(f"[yellow]Still {reached:.0f} C after 10 minutes; timing anyway.[/yellow]")
 
 
 def directory_size_mb(path: Path) -> float:
@@ -443,6 +461,7 @@ def cmd_exits_profile(args: argparse.Namespace) -> int:
         f"Profiling {count} images at every exit, {args.runtime} {args.precision}, "
         f"{args.threads} thread(s), after {args.warmup} warmup runs"
     )
+    cool_down(args.cool_to)
     if args.runtime == "pytorch":
         rows = profile_exits(
             model,
@@ -678,6 +697,7 @@ def cmd_split_profile(args: argparse.Namespace) -> int:
         f"Profiling payloads for {count} images at every split point, "
         f"{args.precision} stages, {args.threads} thread(s)"
     )
+    cool_down(args.cool_to)
     rows = profile_splits(
         build_stage_sessions(paths, threads=args.threads),
         dataset,
@@ -763,6 +783,7 @@ def cmd_server_profile(args: argparse.Namespace) -> int:
     count = len(dataset) if args.limit is None else min(args.limit, len(dataset))
     target = accelerator or f"{threads} CPU thread(s)"
     console.print(f"Profiling the server side of {count} images on {target}, {args.runtime}")
+    cool_down(args.cool_to)
     rows = profile_server(
         server,
         dataset,
@@ -1051,6 +1072,12 @@ def build_parser() -> argparse.ArgumentParser:
     exits_profile.add_argument("--threads", type=int, default=2, help="pinned thread count")
     exits_profile.add_argument("--warmup", type=int, default=10, help="discarded runs first")
     exits_profile.add_argument(
+        "--cool-to",
+        type=float,
+        default=None,
+        help="wait until the CPU is at or below this many degrees C before timing",
+    )
+    exits_profile.add_argument(
         "--limit", type=int, default=None, help="profile only the first N images"
     )
     exits_profile.add_argument(
@@ -1131,6 +1158,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     split_profile.add_argument("--threads", type=int, default=2, help="pinned thread count")
     split_profile.add_argument("--warmup", type=int, default=10, help="discarded runs first")
+    split_profile.add_argument(
+        "--cool-to",
+        type=float,
+        default=None,
+        help="wait until the CPU is at or below this many degrees C before timing",
+    )
     split_profile.add_argument("--level", type=int, default=3, help="zstd compression level")
     split_profile.add_argument(
         "--limit", type=int, default=None, help="profile a seeded random sample of N images"
@@ -1169,6 +1202,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--threads", type=int, default=6, help="CPU threads, for a CPU server or JPEG decoding"
     )
     server_profile.add_argument("--warmup", type=int, default=10, help="discarded runs first")
+    server_profile.add_argument(
+        "--cool-to",
+        type=float,
+        default=None,
+        help="wait until the CPU is at or below this many degrees C before timing",
+    )
     server_profile.add_argument("--level", type=int, default=3, help="zstd compression level")
     server_profile.add_argument(
         "--limit", type=int, default=None, help="profile a seeded random sample of N images"

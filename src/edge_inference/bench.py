@@ -26,6 +26,7 @@ is fixed in one place rather than reinvented per experiment:
   out: it identifies the operator rather than the hardware.
 """
 
+import functools
 import os
 import platform
 import subprocess
@@ -212,6 +213,67 @@ def cpu_policy() -> dict[str, object]:
         "energy_preference": _read(cpufreq / "energy_performance_preference"),
         "max_frequency_mhz": int(max_khz) // 1000 if max_khz and max_khz.isdigit() else None,
     }
+
+
+def cpu_state() -> dict[str, float | None]:
+    """The CPU's actual clock and temperature at this moment.
+
+    `cpu_policy` says how fast the CPU may run; this says how fast it is
+    running. Under sustained load a laptop CPU drops from its boost clock
+    within seconds as it heats up: on the reference laptop, six threads of
+    continuous inference fell from 3.69 to about 3.25 GHz within twelve
+    seconds while latency rose about 10%. A long profile therefore runs slower
+    than a short benchmark, and a run that follows another starts hotter.
+    Recording the state on every row is what makes that visible.
+
+    `cpu_mhz_max` is the fastest core, which tracks the busy ones; the mean is
+    pulled down by idle cores. Linux only, and None where a value is missing.
+    """
+    clocks = [_read(path) for path in _frequency_files()]
+    mhz = [int(value) / 1000 for value in clocks if value and value.isdigit()]
+    sensor = _temperature_file()
+    raw = _read(sensor) if sensor else None
+    return {
+        "cpu_mhz_max": max(mhz) if mhz else None,
+        "cpu_mhz_mean": sum(mhz) / len(mhz) if mhz else None,
+        "cpu_temp_c": int(raw) / 1000 if raw and raw.lstrip("-").isdigit() else None,
+    }
+
+
+# Hardware monitor names that report the CPU package or die temperature:
+# AMD, Intel, and the Raspberry Pi's SoC.
+CPU_SENSORS = ("k10temp", "zenpower", "coretemp", "cpu_thermal")
+
+
+@functools.cache
+def _frequency_files() -> tuple[Path, ...]:
+    return tuple(sorted(Path("/sys/devices/system/cpu").glob("cpu[0-9]*/cpufreq/scaling_cur_freq")))
+
+
+@functools.cache
+def _temperature_file() -> Path | None:
+    for hwmon in sorted(Path("/sys/class/hwmon").glob("hwmon*")):
+        if _read(hwmon / "name") in CPU_SENSORS and (hwmon / "temp1_input").exists():
+            return hwmon / "temp1_input"
+    return None
+
+
+def wait_for_cooldown(
+    target_c: float, *, timeout_s: float = 600.0, poll_s: float = 2.0
+) -> float | None:
+    """Block until the CPU is at or below `target_c`, then return its temperature.
+
+    Starting every run from the same temperature removes one reason two
+    profiles measured one after another differ. Gives up after `timeout_s`
+    rather than hanging, and returns immediately with None where no CPU
+    temperature can be read.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        current = cpu_state()["cpu_temp_c"]
+        if current is None or current <= target_c or time.monotonic() >= deadline:
+            return current
+        time.sleep(poll_s)
 
 
 def machine_info() -> dict[str, object]:

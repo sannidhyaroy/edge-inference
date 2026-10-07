@@ -30,7 +30,7 @@ import numpy as np
 import onnxruntime as ort
 from torch.utils.data import Dataset
 
-from edge_inference.bench import cpu_model, cpu_policy, machine_model, power_source
+from edge_inference.bench import cpu_model, cpu_policy, cpu_state, machine_model, power_source
 from edge_inference.config import SEED
 from edge_inference.export import FEATURES_NAME, OUTPUT_NAME, run_stage
 from edge_inference.models import EXIT_NAMES
@@ -166,5 +166,10 @@ def profile_splits(
                     **conditions,
                 }
             )
+
+        # Read after the image's timing, so the read itself is never timed.
+        state = cpu_state()
+        for row in rows[-len(maps) :]:
+            row.update(state)
 
     return rows

@@ -39,6 +39,7 @@ from torch.utils.data import Dataset
 from edge_inference.bench import (
     cpu_model,
     cpu_policy,
+    cpu_state,
     machine_model,
     power_source,
     synchronize,
@@ -207,6 +208,7 @@ def profile_server(
     rows: list[dict[str, object]] = []
     for index in indices:
         image, label = dataset[index]
+        first_row = len(rows)
         for arrival in arrivals(server, image, files[index].read_bytes(), level=level):
             x, receive_ms = _timed(arrival.receive)
             predicted, compute_ms = _timed(server.run_from, arrival.stage, x)
@@ -229,4 +231,10 @@ def profile_server(
                     **conditions,
                 }
             )
+
+        # The CPU's clock and temperature, read after the image's timing. On a
+        # GPU server the CPU still decodes JPEGs and copies data.
+        state = cpu_state()
+        for row in rows[first_row:]:
+            row.update(state)
     return rows

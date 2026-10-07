@@ -72,6 +72,34 @@ def test_machine_info_records_power_conditions():
     assert info["power_source"] in ("ac", "battery", None)
 
 
+def test_cpu_state_is_plausible_or_absent():
+    """Clock and temperature either read as sane numbers or are None, never junk."""
+    from edge_inference.bench import cpu_state
+
+    state = cpu_state()
+
+    assert set(state) == {"cpu_mhz_max", "cpu_mhz_mean", "cpu_temp_c"}
+    if state["cpu_mhz_max"] is not None:
+        assert 100 <= state["cpu_mhz_mean"] <= state["cpu_mhz_max"] <= 10_000
+    if state["cpu_temp_c"] is not None:
+        assert 0 < state["cpu_temp_c"] < 125
+
+
+def test_cooldown_returns_once_cool_enough(monkeypatch):
+    """The wait ends at the target, and never hangs past its timeout."""
+    from edge_inference import bench
+
+    readings = iter([90.0, 80.0, 55.0, 50.0])
+    monkeypatch.setattr(bench, "cpu_state", lambda: {"cpu_temp_c": next(readings)})
+    assert bench.wait_for_cooldown(60.0, poll_s=0) == 55.0
+
+    monkeypatch.setattr(bench, "cpu_state", lambda: {"cpu_temp_c": 95.0})
+    assert bench.wait_for_cooldown(60.0, timeout_s=0, poll_s=0) == 95.0
+
+    monkeypatch.setattr(bench, "cpu_state", lambda: {"cpu_temp_c": None})
+    assert bench.wait_for_cooldown(60.0, poll_s=0) is None
+
+
 def test_machine_info_excludes_hostname():
     """Results files are committed to a public repo, so no personal identifiers."""
     import platform

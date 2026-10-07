@@ -31,6 +31,7 @@ from torch.utils.data import Dataset
 from edge_inference.bench import (
     cpu_model,
     cpu_policy,
+    cpu_state,
     machine_model,
     power_source,
     set_thread_count,
@@ -206,6 +207,12 @@ def _profile(
                     **conditions,
                 }
             )
+
+        # The clock and temperature the image just ran at, read after its
+        # timing so the read itself is never timed.
+        state = cpu_state()
+        for row in rows[-len(EXIT_NAMES) :]:
+            row.update(state)
 
     return rows
 
