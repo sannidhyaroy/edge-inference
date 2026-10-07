@@ -25,6 +25,7 @@ is really a data problem.
 """
 
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
@@ -32,7 +33,7 @@ from onnxruntime.quantization import CalibrationDataReader, QuantType, quantize_
 from onnxruntime.quantization.shape_inference import quant_pre_process
 from torch.utils.data import DataLoader
 
-from edge_inference.export import INPUT_NAME
+from edge_inference.export import FEATURES_NAME, INPUT_NAME, build_session, run_stage
 
 
 class DataLoaderCalibrationReader(CalibrationDataReader):
@@ -61,6 +62,34 @@ class DataLoaderCalibrationReader(CalibrationDataReader):
 
     def rewind(self) -> None:
         raise NotImplementedError("this reader is single pass; build a new one instead")
+
+
+class ArrayCalibrationReader(CalibrationDataReader):
+    """Feeds precomputed input batches to the calibrator.
+
+    Used for the later stages of an early-exit model, whose inputs are feature
+    maps produced by the stage before rather than images from a dataloader.
+    """
+
+    def __init__(self, batches: Sequence[np.ndarray], *, input_name: str = INPUT_NAME) -> None:
+        self.input_name = input_name
+        self._iterator = iter(batches)
+
+    def get_next(self) -> dict[str, np.ndarray] | None:
+        batch = next(self._iterator, None)
+        return None if batch is None else {self.input_name: batch}
+
+
+def calibration_batches(loader: DataLoader, *, limit: int) -> list[np.ndarray]:
+    """Collect image batches from a dataloader until at least `limit` images."""
+    batches = []
+    seen = 0
+    for images, _ in loader:
+        if seen >= limit:
+            break
+        batches.append(images.numpy())
+        seen += int(images.shape[0])
+    return batches
 
 
 def quantize_onnx(
@@ -115,3 +144,29 @@ def quantize_onnx(
         )
 
     return destination
+
+
+def quantize_exit_stages(
+    sources: Sequence[Path],
+    destinations: Sequence[Path],
+    batches: list[np.ndarray],
+    *,
+    per_channel: bool = True,
+) -> list[Path]:
+    """Quantize each stage graph of an early-exit model to INT8.
+
+    The first stage calibrates on images. Every later stage calibrates on the
+    features the stage before it produces, because that is what it receives
+    when deployed; calibrating it on images would not even run.
+
+    Those features come from the float stage, not the quantized one. That is
+    what quantizing the whole network at once would do, since its calibrator
+    records every layer's range by running the float model, so splitting into
+    stages changes where the graphs end and nothing else.
+    """
+    for index, (source, destination) in enumerate(zip(sources, destinations, strict=True)):
+        quantize_onnx(source, destination, ArrayCalibrationReader(batches), per_channel=per_channel)
+        if index < len(sources) - 1:
+            session = build_session(source)
+            batches = [run_stage(session, batch)[FEATURES_NAME] for batch in batches]
+    return list(destinations)

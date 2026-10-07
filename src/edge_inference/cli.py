@@ -29,8 +29,10 @@ from edge_inference.export import (
     DEFAULT_OPSET,
     build_session,
     evaluate_session,
+    evaluate_stages,
     export_exit_stages,
     export_onnx,
+    stage_paths,
     verify_parity,
     verify_stage_parity,
 )
@@ -41,7 +43,12 @@ from edge_inference.models import (
     build_early_exit,
 )
 from edge_inference.profiling import operations_per_exit, profile_model
-from edge_inference.quantization import DataLoaderCalibrationReader, quantize_onnx
+from edge_inference.quantization import (
+    DataLoaderCalibrationReader,
+    calibration_batches,
+    quantize_exit_stages,
+    quantize_onnx,
+)
 from edge_inference.training import fine_tune
 
 console = Console()
@@ -535,6 +542,86 @@ def cmd_exits_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_exits_quantize(args: argparse.Namespace) -> int:
+    """Quantize each stage of an early-exit model and compare every exit."""
+    seed_everything()
+
+    base = Path(args.checkpoint).with_suffix("")
+    sources = stage_paths(base)
+    missing = [path for path in sources if not path.exists()]
+    if missing:
+        console.print(
+            f"[bold red]No stage graph at {missing[0]}.[/bold red] Run `edge exits export` first."
+        )
+        return 1
+
+    # Training images with evaluation preprocessing, as for the plain model.
+    calibration_dataset = load_split("train", root=Path(args.root), augment=False)
+    calibration_loader = build_dataloader(
+        calibration_dataset, batch_size=args.batch_size, shuffle=True
+    )
+    batches = calibration_batches(calibration_loader, limit=args.calibration_images)
+
+    console.print(
+        f"Calibrating on [bold]{args.calibration_images}[/bold] training images, "
+        "then quantizing each stage to INT8"
+    )
+    destinations = quantize_exit_stages(
+        sources,
+        stage_paths(base, suffix=".int8.onnx"),
+        batches,
+        per_channel=not args.per_tensor,
+    )
+
+    val_dataset = load_split("val", root=Path(args.root))
+    val_loader = build_dataloader(val_dataset, batch_size=args.batch_size, shuffle=False)
+
+    rows = []
+    for precision, paths in (("float32", sources), ("int8", destinations)):
+        console.print(f"Evaluating {precision} on {len(val_dataset)} images")
+        sessions = [build_session(path, threads=args.threads) for path in paths]
+        accuracies = evaluate_stages(sessions, val_loader)
+        cumulative_mib = 0.0
+        for name, path, accuracy in zip(EXIT_NAMES, paths, accuracies, strict=True):
+            size_mib = path.stat().st_size / 2**20
+            cumulative_mib += size_mib
+            rows.append(
+                {
+                    "checkpoint": Path(args.checkpoint).name,
+                    "precision": precision,
+                    "exit_name": name,
+                    "accuracy": accuracy,
+                    "stage_mib": size_mib,
+                    # What a device that stops at this exit must hold in memory.
+                    "cumulative_mib": cumulative_mib,
+                }
+            )
+
+    frame = pd.DataFrame(rows)
+    table = Table(title="float32 against INT8 at every exit")
+    for column in ("exit", "float32", "int8", "drop (pts)", "float32 MiB", "int8 MiB"):
+        table.add_column(column, justify="right")
+    by_precision = {p: group.reset_index() for p, group in frame.groupby("precision")}
+    for (_, f32), (_, i8) in zip(
+        by_precision["float32"].iterrows(), by_precision["int8"].iterrows(), strict=True
+    ):
+        table.add_row(
+            f32["exit_name"],
+            f"{f32['accuracy'] * 100:.2f}%",
+            f"{i8['accuracy'] * 100:.2f}%",
+            f"{(f32['accuracy'] - i8['accuracy']) * 100:+.2f}",
+            f"{f32['cumulative_mib']:.2f}",
+            f"{i8['cumulative_mib']:.2f}",
+        )
+    console.print(table)
+
+    out = Path(args.results or RESULTS_DIR / f"quantization_{base.name}.csv")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(out, index=False)
+    console.print(f"Wrote [bold]{out}[/bold]")
+    return 0
+
+
 def cmd_exits_sweep(args: argparse.Namespace) -> int:
     """Exit vectors and a confidence-threshold sweep from a recorded profile."""
     profile = Path(args.profile)
@@ -800,6 +887,33 @@ def build_parser() -> argparse.ArgumentParser:
         "--results", default=None, help="parity CSV (default names the checkpoint)"
     )
     exits_export.set_defaults(func=cmd_exits_export)
+
+    exits_quantize = exits_sub.add_parser(
+        "quantize", help="quantize each stage to INT8 and compare every exit against float32"
+    )
+    exits_quantize.add_argument("--root", default=str(DATA_DIR), help="dataset directory")
+    exits_quantize.add_argument(
+        "--checkpoint",
+        default=str(CHECKPOINT_DIR / "resnet18_early_exit_imagenette.pt"),
+        help="the stage graphs exported beside it are what gets quantized",
+    )
+    exits_quantize.add_argument(
+        "--calibration-images",
+        type=int,
+        default=256,
+        help="training images used to measure activation ranges",
+    )
+    exits_quantize.add_argument(
+        "--per-tensor",
+        action="store_true",
+        help="one scale per layer instead of per convolution filter, usually less accurate",
+    )
+    exits_quantize.add_argument("--batch-size", type=int, default=32)
+    exits_quantize.add_argument("--threads", type=int, default=6, help="threads for evaluation")
+    exits_quantize.add_argument(
+        "--results", default=None, help="accuracy CSV (default names the checkpoint)"
+    )
+    exits_quantize.set_defaults(func=cmd_exits_quantize)
 
     exits_sweep = exits_sub.add_parser(
         "sweep", help="exit vectors and a confidence-threshold sweep from a profile"

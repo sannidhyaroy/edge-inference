@@ -140,10 +140,14 @@ class ExitStage(nn.Module):
         return features, logits
 
 
-def stage_paths(base: Path) -> list[Path]:
-    """Where each stage graph of the model at `base` (no suffix) is written."""
+def stage_paths(base: Path, *, suffix: str = ".onnx") -> list[Path]:
+    """Where each stage graph of the model at `base` (no suffix) is written.
+
+    `suffix` distinguishes precisions, as `.int8.onnx` does for quantized stages.
+    """
     return [
-        base.with_name(f"{base.name}.stage{index}.onnx") for index in range(1, len(EXIT_NAMES) + 1)
+        base.with_name(f"{base.name}.stage{index}{suffix}")
+        for index in range(1, len(EXIT_NAMES) + 1)
     ]
 
 
@@ -225,6 +229,27 @@ def evaluate_session(session: ort.InferenceSession, loader) -> dict[str, float]:
         seen += int(targets.shape[0])
 
     return {"accuracy": correct / seen, "images": seen}
+
+
+def evaluate_stages(sessions: Sequence[ort.InferenceSession], loader) -> list[float]:
+    """Top-1 accuracy at every exit of chained stage graphs over a dataloader.
+
+    The early-exit counterpart of `evaluate_session`, with the stages chained
+    as they run when deployed.
+    """
+    correct = [0] * len(sessions)
+    seen = 0
+
+    for images, targets in loader:
+        x = images.numpy()
+        labels = targets.numpy()
+        for index, session in enumerate(sessions):
+            outputs = run_stage(session, x)
+            correct[index] += int((outputs[OUTPUT_NAME].argmax(axis=1) == labels).sum())
+            x = outputs.get(FEATURES_NAME)
+        seen += int(labels.shape[0])
+
+    return [hits / seen for hits in correct]
 
 
 def verify_parity(
