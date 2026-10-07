@@ -50,6 +50,13 @@ from edge_inference.models import (
     build_backbone,
     build_early_exit,
 )
+from edge_inference.offload import (
+    NETWORKS,
+    breakeven_mbps,
+    breakeven_slowdown,
+    load_components,
+    summarise,
+)
 from edge_inference.profiling import operations_per_exit, profile_model
 from edge_inference.quantization import (
     DataLoaderCalibrationReader,
@@ -822,6 +829,99 @@ def cmd_server_profile(args: argparse.Namespace) -> int:
     return 0
 
 
+# Servers profiled so far: the name each gets in the offload table, and the
+# suffix of its server profile.
+SERVERS = {"t4": "pytorch_float32_cuda", "cpu_t6": "onnxruntime_float32_t6"}
+
+
+def cmd_offload_table(args: argparse.Namespace) -> int:
+    """Join every profile into per-image costs and summarise them per network."""
+    stem = Path(args.checkpoint).stem
+    results = Path(args.results)
+    try:
+        components = load_components(results, stem, threads=args.threads, servers=SERVERS)
+    except FileNotFoundError as error:
+        console.print(f"[bold red]Missing profile:[/bold red] {error.filename}")
+        return 1
+
+    summary = summarise(components)
+    local = components[(components["mode"] == "local") & (components["point"] == "layer4")]
+    breakeven = pd.concat(
+        [
+            breakeven_mbps(
+                components,
+                rtt_ms=network.rtt_ms,
+                local_ms=local[local["device_precision"] == precision]["device_ms"].median(),
+            ).assign(network=name, against=f"local {precision}")
+            for name, network in NETWORKS.items()
+            for precision in ("float32", "int8")
+        ],
+        ignore_index=True,
+    )
+
+    # A readable cut of the summary: the endpoints of each way of working.
+    shown = [
+        ("local", "layer4", "float32", "none", "none"),
+        ("local", "layer4", "int8", "none", "none"),
+        ("local", "layer2", "int8", "none", "none"),
+        ("split", "layer3", "float32", "uint8_zstd", "t4"),
+        ("offload", "input", "none", "jpeg", "t4"),
+        ("offload", "input", "none", "jpeg", "cpu_t6"),
+    ]
+    keys = ["mode", "point", "device_precision", "payload", "server"]
+    for name, network in NETWORKS.items():
+        table = Table(
+            title=f"{name}: {network.rtt_ms:g} ms round trip, {network.uplink_mbps:g} Mbps uplink"
+        )
+        for column in ("configuration", "accuracy", "median ms", "p95 ms", "within 50 ms"):
+            table.add_column(column, justify="right")
+        rows = summary[summary["network"] == name].set_index(keys)
+        for key in shown:
+            row = rows.loc[key]
+            mode, point, precision, payload, server = key
+            label = {
+                "local": f"local {precision} to {point}",
+                "split": f"split after {point}, {payload}, {server}",
+                "offload": f"offload to {server}",
+            }[mode]
+            table.add_row(
+                label,
+                f"{row['accuracy'] * 100:.2f}%",
+                f"{row['median_ms']:.2f}",
+                f"{row['p95_ms']:.2f}",
+                f"{row['within_50ms'] * 100:.1f}%",
+            )
+        console.print(table)
+
+    slowdown = breakeven_slowdown(summary)
+    table = Table(title="How much slower a device must be for sending to pay off, by median")
+    for column in ("network", "fastest way to send", "its median ms", "vs float32", "vs INT8"):
+        table.add_column(column, justify="right")
+    for network, group in slowdown.groupby("network", sort=False):
+        factors = group.set_index("against")["slowdown"]
+        first = group.iloc[0]
+        how = "offload" if first["best_mode"] == "offload" else f"split after {first['best_point']}"
+        table.add_row(
+            str(network),
+            f"{how} to {first['best_server']}",
+            f"{first['best_median_ms']:.2f}",
+            f"{factors['local float32']:.2f}x",
+            f"{factors['local int8']:.2f}x",
+        )
+    console.print(table)
+
+    outputs = {
+        f"offload_components_{stem}.csv.gz": components,
+        f"offload_slowdown_{stem}.csv": slowdown,
+        f"offload_summary_{stem}.csv": summary,
+        f"offload_breakeven_{stem}.csv": breakeven,
+    }
+    for filename, frame in outputs.items():
+        frame.to_csv(results / filename, index=False)
+        console.print(f"Wrote [bold]{results / filename}[/bold] ({len(frame)} rows)")
+    return 0
+
+
 def cmd_exits_sweep(args: argparse.Namespace) -> int:
     """Exit vectors and a confidence-threshold sweep from a recorded profile."""
     profile = Path(args.profile)
@@ -1216,6 +1316,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--out", default=None, help="default names the checkpoint, runtime and hardware"
     )
     server_profile.set_defaults(func=cmd_server_profile)
+
+    offload = subparsers.add_parser("offload", help="per-image costs of every mode, with networks")
+    offload_sub = offload.add_subparsers(dest="offload_command", required=True)
+    offload_table = offload_sub.add_parser(
+        "table", help="join exit, split and server profiles and summarise per network"
+    )
+    offload_table.add_argument(
+        "--checkpoint",
+        default=str(CHECKPOINT_DIR / "resnet18_early_exit_imagenette.pt"),
+        help="names the profiles to join; the file itself is not read",
+    )
+    offload_table.add_argument(
+        "--threads", type=int, default=2, help="thread count of the device profiles"
+    )
+    offload_table.add_argument("--results", default=str(RESULTS_DIR), help="profile directory")
+    offload_table.set_defaults(func=cmd_offload_table)
 
     bench = subparsers.add_parser("bench", help="measure forward pass latency")
     bench.add_argument("--backbone", default="resnet18", choices=SUPPORTED_BACKBONES)
