@@ -22,7 +22,10 @@ imposes.
     - [Export to ONNX](#export-to-onnx)
     - [Quantize to INT8](#quantize-to-int8)
     - [Train with early exits](#train-with-early-exits)
+    - [Export the exit stages](#export-the-exit-stages)
+    - [Quantize the exit stages](#quantize-the-exit-stages)
     - [Profile every exit](#profile-every-exit)
+    - [Sweep confidence thresholds](#sweep-confidence-thresholds)
 - [Training on a GPU machine](#training-on-a-gpu-machine)
     - [Getting a Colab runtime](#getting-a-colab-runtime)
     - [On the runtime](#on-the-runtime)
@@ -114,8 +117,9 @@ edge-inference/
 │   ├── cli.py              argparse entry point, exposed as the `edge` command
 │   ├── config.py           paths, seed, dataset constants
 │   ├── data.py             Imagenette loading and preprocessing
+│   ├── exit_analysis.py    exit vectors and confidence-threshold sweeps
 │   ├── exit_profiler.py    per-image latency and confidence at every exit
-│   ├── export.py           ONNX export and parity checking
+│   ├── export.py           ONNX export, per-stage export, parity checking
 │   ├── models.py           backbone construction, early-exit wrapper
 │   ├── profiling.py        parameters, operations, cost per exit, size
 │   ├── quantization.py     static INT8 quantization and calibration
@@ -390,18 +394,64 @@ heads pull it toward themselves and the final exit ends up worse than a plain
 model's. `--exit-weights` sets each exit's share of the loss, shallowest first.
 `--exit-weights 0.3,0.3,1` favours the final exit, at the early exits' expense.
 
+### Export the exit stages
+
+```bash
+uv run edge exits export
+```
+
+Writes the early-exit model as three ONNX graphs beside its checkpoint,
+`<checkpoint>.stage1.onnx` to `stage3.onnx`, one per stage. Each runs its stage
+and exit head and returns the exit's `logits` and the `features` the next stage
+takes.
+
+One graph per stage is what makes stopping possible. ONNX Runtime always runs
+a graph to the end, so a single exported model would compute every exit for
+every image. With separate stages, the application runs stage one, reads the
+exit's confidence, and only then decides whether to run stage two. The same
+boundary is where split computing would cut the network, and `features` is the
+tensor that would cross it.
+
+Parity is checked as for the plain model, with the stages chained the way they
+run when deployed: each is fed the previous ONNX stage's output, not
+PyTorch's, so an error at one stage shows up at every exit after it. Parity
+results go to `results/onnx_parity_<checkpoint>.csv`.
+
+### Quantize the exit stages
+
+```bash
+uv run edge exits quantize
+```
+
+Quantizes each stage graph to INT8 as `<checkpoint>.stage1.int8.onnx` and so
+on, then evaluates float32 and INT8 at every exit over the validation set,
+writing `results/quantization_<checkpoint>.csv`.
+
+Only the first stage can be calibrated on images. Every later stage takes a
+feature map, so it is calibrated on what the stage before it produces from the
+same calibration images. Those features come from the float stage, which is
+also what quantizing the whole network at once would use, so splitting into
+stages changes where graphs end and not the ranges recorded.
+
 ### Profile every exit
 
 ```bash
-uv run edge exits profile --threads 2
+uv run edge exits profile --runtime onnxruntime --precision int8 --threads 2
 ```
 
 Runs each validation image through the early-exit model one stage at a time,
 recording at every exit the cumulative latency, the top probability, entropy,
 the prediction and whether it was correct. One row per image per exit, written
-to `results/exit_profile_<checkpoint>_pytorch_float32_t2.csv.gz`. Compressed
-because profiles are measurements rather than derived files: re-running one
-measures a different moment instead of reproducing it, so they are committed.
+to `results/exit_profile_<checkpoint>_<runtime>_<precision>_t2.csv.gz`.
+Compressed because profiles are measurements rather than derived files:
+re-running one measures a different moment instead of reproducing it, so they
+are committed.
+
+`--runtime onnxruntime` runs the stage graphs from the two commands above,
+which is how the model would be deployed. `--runtime pytorch`, the default,
+runs the checkpoint directly and is about 1.6x slower at 2 threads. Both share
+one timing loop, so the difference between their profiles is the runtime
+rather than the harness. INT8 is profiled through ONNX Runtime only.
 
 Every exit is always reached, so the table records what each exit would answer.
 Any confidence threshold, or any other stopping rule, can then be applied
@@ -411,10 +461,21 @@ afterwards from the same measurements instead of being fixed before measuring.
 first N: image folders are sorted by class, so the first few hundred validation
 images are all one class.
 
-> [!NOTE]
-> Latency here is measured in PyTorch, which runs this model about 3x slower
-> than ONNX Runtime. Confidence and correctness are unaffected, but treat the
-> timings as relative until the ONNX Runtime path lands.
+### Sweep confidence thresholds
+
+```bash
+uv run edge exits sweep results/exit_profile_<...>.csv.gz
+```
+
+Applies a stopping rule to a recorded profile: each image stops at the first
+exit whose top probability reaches the threshold, and the final exit always
+answers. Thresholds run from 0.10 to 0.99, and each gives an accuracy, a mean,
+median and p95 latency, and the share of images stopping at each exit. Writes
+`exit_sweep_<...>.csv`, plus `exit_vectors_<...>.csv` with the `c` and `a`
+vectors.
+
+Nothing is re-measured, since the profile already holds every exit's answer for
+every image. That is why the profile keeps all exits rather than stopping early.
 
 ---
 
