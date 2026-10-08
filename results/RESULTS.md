@@ -242,6 +242,125 @@ confidence, which is the setting the next measurements address.
 
 ---
 
+## 9. What crosses the network when splitting
+
+Every exit but the last is also a split point: the device runs the network up to
+it and sends the feature map for a server to finish. Median payload per image,
+equal-weights model, in decimal kilobytes:
+
+| split after |  float32 | + zstd | 8-bit | + zstd |
+| ----------- | -------: | -----: | ----: | -----: |
+| `layer2`    |    204.8 |  114.3 |  51.2 |   29.5 |
+| `layer3`    |    102.4 |   52.7 |  25.6 |   13.3 |
+
+Full offload sends the JPEG instead: **7.9 KB** median, 12.0 KB at p95.
+
+**Naive splitting sends more than offloading.** Even the smallest payload
+measured, 10.8 KB after `layer3` from INT8 device stages sent as 8 bits and
+compressed, is larger than the median JPEG. A feature map holds fewer values
+than the image, 51,200 or 25,600 against 76,800, but JPEG is lossy coding built
+around how images look, and nothing comparable exists for feature maps.
+Splitting a standard ResNet only pays with a trained bottleneck that shrinks
+the feature map, which is what the split computing literature adds.
+
+**An 8-bit payload is nearly free.** Each feature map is mapped onto 256 levels
+using its own range, with no calibration. Across all four split profiles it
+changed one prediction in 3925. For the equal-weights model, quantizing and
+compressing costs the device a median 0.19 to 0.40 ms.
+
+**About half of each feature map is zero**, 45% after `layer2` and 49% after
+`layer3`, left by the ReLU at the end of each block. That is what zstd exploits.
+Feature maps from INT8 stages compress far better even as float32, 42.8 KB
+against 114.3 KB after `layer2`, because their values take only 256 distinct
+levels.
+
+---
+
+## 10. Server time
+
+Median time per image on the server, from bytes arriving to an answer, for the
+equal-weights model. *Receive* is decoding the JPEG with the same preprocessing
+the device uses, or decompressing and dequantizing a feature map:
+
+| arrives as                | laptop CPU, receive | compute | total |  p95 | T4, receive | compute | total |   p95 |
+| ------------------------- | ------------------: | ------: | ----: | ---: | ----------: | ------: | ----: | ----: |
+| JPEG                      |                1.47 |    4.79 |  6.27 | 7.12 |        1.95 |    3.20 |  5.17 | 20.14 |
+| float32 after `layer2`    |                0.03 |    2.45 |  2.48 | 3.00 |        0.03 |    1.86 |  1.89 |  4.05 |
+| 8-bit zstd after `layer2` |                0.18 |    2.40 |  2.57 | 3.14 |        0.22 |    1.88 |  2.11 |  4.36 |
+| float32 after `layer3`    |                0.02 |    1.31 |  1.33 | 1.73 |        0.02 |    1.16 |  1.19 |  1.87 |
+| 8-bit zstd after `layer3` |                0.11 |    1.25 |  1.36 | 1.77 |        0.14 |    1.18 |  1.32 |  2.55 |
+
+The laptop CPU server is ONNX Runtime on 6 threads, sustaining about 3.39 GHz.
+The GPU server is a free Colab Tesla T4 through PyTorch, decoding JPEGs on the
+runtime's 2 vCPUs.
+
+**The T4 is barely faster than the laptop for this network.** The network alone
+runs 1.5x faster, 3.20 against 4.79 ms. One image at a time, eager PyTorch
+issues each layer as its own GPU launch, and a network as small as ResNet-18
+spends most of its time on launch overhead rather than arithmetic. A server
+built with CUDA graphs or TensorRT would do better; this is the simple setup.
+
+**The free T4's tail belongs to the shared machine.** Its JPEG p95 is 20.14 ms
+against a 5.17 ms median, mostly in decoding on the shared vCPUs, and it comes in
+bursts: the p95 of successive 400-image windows alternates between about 6 and
+25 ms, at different moments in each run. That is the draft's server-load
+uncertainty appearing on its own. The VM exposes no CPU clock or temperature, so
+those columns are empty for it.
+
+---
+
+## 11. Local, split or offload
+
+Each image's end-to-end time per way of processing it is its measured device,
+preparation and server time plus a network: a round trip, and the payload
+over the uplink. The networks are **illustrative assumptions**, not
+measurements, chosen to span a range. The per-image components are stored
+without any network, in `offload_components_*.csv.gz`, so any channel model can
+replace them. Equal-weights model, laptop at 2 threads as the device:
+
+| way of processing                    | accuracy | Wi-Fi median | 5G median | 4G median | poor 4G median |
+| ------------------------------------ | -------: | -----------: | --------: | --------: | -------------: |
+| local, float32                       |   95.44% |         9.11 |      9.11 |      9.11 |           9.11 |
+| local, INT8                          |   93.81% |         5.10 |      5.10 |      5.10 |           5.10 |
+| local INT8, exit 1                   |   56.79% |         2.71 |      2.71 |      2.71 |           2.71 |
+| split after `layer3`, 8-bit zstd, T4 |   95.41% |        14.20 |     30.27 |     68.84 |         161.34 |
+| offload to T4                        |   95.44% |        10.85 |     26.54 |     61.88 |         137.88 |
+| offload to laptop CPU server         |   95.44% |        11.95 |     27.61 |     62.77 |         138.29 |
+
+Wi-Fi is 5 ms round trip and 100 Mbps uplink, 5G 20 ms and 50 Mbps, 4G 50 ms
+and 10 Mbps, poor 4G 100 ms and 2 Mbps.
+
+**With this laptop as the device, running locally always wins.** Even over
+Wi-Fi, offloading takes 10.85 ms against 9.11 ms locally in float32 and 5.10 ms
+in INT8: the round trip and the server's own 5 ms already exceed what the
+laptop needs. Offloading the JPEG is the fastest way of sending on every
+network, and splitting never wins, as section 9 predicts.
+
+**The real question is how slow the device is.** Sending pays only for a device
+this many times slower than the laptop, by median:
+
+| network | against local float32 | against local INT8 |
+| ------- | --------------------: | -----------------: |
+| Wi-Fi   |                 1.19x |              2.13x |
+| 5G      |                 2.91x |              5.20x |
+| 4G      |                 6.79x |             12.13x |
+| poor 4G |                15.13x |             27.04x |
+
+A boosting laptop CPU is far faster than an in-vehicle board or a single-board
+computer, so the factors, not the raw comparison, are the transferable result.
+They assume a slower device is slower by a constant factor, which holds only
+roughly.
+
+**Deadlines bring the tail back.** Over Wi-Fi the T4 has the better median,
+10.85 against 11.95 ms for the laptop server, but answers 94.2% of frames within
+20 ms against the laptop server's 99.6%, because of its shared-machine tail. A
+deadline-driven controller would prefer the slower, steadier server.
+
+The split rows use float32 device stages only. A feature map from INT8 stages
+is smaller, but how a float32 server answers it has not been measured.
+
+---
+
 ## What these numbers are not
 
 **The reference machine is a laptop, not an edge board.** It stands in for one,
@@ -262,7 +381,8 @@ compared by accident.
 
 ## Next
 
-Offloading. Every result above is local inference. Next comes the time to run
-the same stages on a server, the size of what would cross the network at each
-split point, and a simulated wireless link, so local, split and offloaded
-inference can be compared per image on the same footing.
+A slower device. The offloading question turns on how much slower than this
+laptop the edge device is, so the next measurement caps the laptop's clock and
+cores to approximate a Raspberry Pi 5-class board. After that, distorted inputs
+(lighting, blur, weather), which the draft names as an uncertainty and which
+should push images to later exits, and a harder dataset.
