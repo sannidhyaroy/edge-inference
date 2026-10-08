@@ -26,6 +26,9 @@ imposes.
     - [Quantize the exit stages](#quantize-the-exit-stages)
     - [Profile every exit](#profile-every-exit)
     - [Sweep confidence thresholds](#sweep-confidence-thresholds)
+    - [Profile split payloads](#profile-split-payloads)
+    - [Profile a server](#profile-a-server)
+    - [Compare local, split and offload](#compare-local-split-and-offload)
 - [Training on a GPU machine](#training-on-a-gpu-machine)
     - [Getting a Colab runtime](#getting-a-colab-runtime)
     - [On the runtime](#on-the-runtime)
@@ -121,8 +124,11 @@ edge-inference/
 │   ├── exit_profiler.py    per-image latency and confidence at every exit
 │   ├── export.py           ONNX export, per-stage export, parity checking
 │   ├── models.py           backbone construction, early-exit wrapper
+│   ├── offload.py          per-image cost of every mode, networks applied
 │   ├── profiling.py        parameters, operations, cost per exit, size
 │   ├── quantization.py     static INT8 quantization and calibration
+│   ├── server.py           server-side time for every way a frame arrives
+│   ├── split.py            what crosses the network at each split point
 │   └── training.py         fine-tuning and evaluation, single or multi-exit
 ├── app/main.py             browser demo comparing float32 and INT8
 ├── tests/                  sanity checks
@@ -477,6 +483,66 @@ vectors.
 Nothing is re-measured, since the profile already holds every exit's answer for
 every image. That is why the profile keeps all exits rather than stopping early.
 
+### Profile split payloads
+
+```bash
+uv run edge split profile --cool-to 60
+```
+
+Every exit except the last is also a split point, where the device can stop and
+send the feature map for a server to finish. For every image and split point
+this records the feature map's size as float32 and as an 8-bit payload, each
+before and after zstd compression, the device time to prepare it, whether the
+8-bit version changes the final answer, and the JPEG size that full offload
+would send instead. Written to `results/split_profile_<checkpoint>_<precision>_t2.csv.gz`.
+
+`--cool-to 60` waits until the CPU is at or below 60 C before timing, and works
+on all three profiling commands. A laptop drops from its boost clock within
+seconds of sustained load, so without it a profile run straight after another
+starts hotter and runs slower. Every row also records the CPU's actual clock and
+temperature, so a run that was disturbed shows it.
+
+### Profile a server
+
+```bash
+uv run edge server profile --runtime pytorch --device cuda --threads 2   # on a GPU machine
+uv run edge server profile --runtime onnxruntime --threads 6 --cool-to 60  # CPU as server
+```
+
+Times what a server pays for every way a frame can arrive: decoding a JPEG for
+full offload, or receiving a float32 or compressed 8-bit feature map at each
+split point, then running the rest of the network. Receiving and computing are
+timed separately, and on a GPU the timer waits for the work to finish rather
+than for it to be queued. The server builds the payloads from the images
+itself, outside the timer, so it needs only the checkpoint and the dataset.
+
+On a free Colab runtime use `--threads 2`, matching its two vCPUs, which do
+the JPEG decoding.
+
+### Compare local, split and offload
+
+```bash
+uv run edge offload table
+```
+
+Joins the exit, split and server profiles of one checkpoint into a table with a
+row per image for each of 16 ways of processing it, with every cost except the
+network: `results/offload_components_<checkpoint>.csv.gz`. The network is left
+out on purpose. Its cost is a round trip plus the payload over the uplink, so
+any channel model can be applied to these rows afterwards, exactly.
+
+For a first look, the command also evaluates four illustrative uplinks and
+writes summaries: accuracy, median and p95 time and the share of frames
+answered within 20, 50 and 100 ms per configuration, the bandwidth each way of
+sending needs to match local inference, and how many times slower than the
+profiled device a device must be before sending pays.
+
+> [!IMPORTANT]
+> The four networks (Wi-Fi, 5G, 4G and poor 4G) are assumptions, set in
+> `offload.py`, not measurements. They are there to show the shape of the
+> trade-off, and should be replaced by a measured or modelled channel before
+> any conclusion depends on them.
+
 ---
 
 ## Training on a GPU machine
@@ -757,6 +823,32 @@ reaches 96.46% at 5.12 ms mean. Every float32 early-exit configuration above
 sending about one in ten to a deeper exit at the same threshold.
 
 The full breakdown, including INT8 accuracy at every exit, is in
+[`results/RESULTS.md`](results/RESULTS.md).
+
+### Local, split or offload
+
+With the laptop at 2 threads as the device, **running locally beat every way of
+sending on every network tried**, even over Wi-Fi: offloading the JPEG to a
+Colab T4 took 10.85 ms median against 9.11 ms locally in float32 and 5.10 ms in
+INT8, because the round trip and the server's own 5 ms already exceed the
+laptop's time.
+
+**Splitting never won.** Even the smallest feature map payload, 10.8 KB with
+INT8 stages, 8-bit values and zstd, is larger than the 7.9 KB median JPEG.
+
+The transferable result is how much slower than this laptop a device must be
+before sending pays, by median:
+
+| network                  | against local float32 | against local INT8 |
+| ------------------------ | --------------------: | -----------------: |
+| Wi-Fi, 5 ms, 100 Mbps    |                 1.19x |              2.13x |
+| 5G, 20 ms, 50 Mbps       |                 2.91x |              5.20x |
+| 4G, 50 ms, 10 Mbps       |                 6.79x |             12.13x |
+| poor 4G, 100 ms, 2 Mbps  |                15.13x |             27.04x |
+
+The networks are illustrative assumptions, and the T4 was served through
+eager PyTorch, which a production server would beat. Both caveats, and the
+server measurements behind this, are in
 [`results/RESULTS.md`](results/RESULTS.md).
 
 ---
