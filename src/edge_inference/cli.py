@@ -30,6 +30,7 @@ from edge_inference.config import (
     seed_everything,
 )
 from edge_inference.data import build_dataloader, image_files, load_split
+from edge_inference.decide import DEADLINES_MS, SLOWDOWNS, TIE_MARGIN, decision_map
 from edge_inference.exit_analysis import default_thresholds, exit_vectors, sweep_thresholds
 from edge_inference.exit_profiler import profile_exit_sessions, profile_exits
 from edge_inference.export import (
@@ -103,6 +104,20 @@ def parse_weight_list(value: str) -> list[float]:
     if not weights or any(w < 0 for w in weights) or sum(weights) == 0:
         raise argparse.ArgumentTypeError("weights must be non-negative and not all zero")
     return weights
+
+
+def parse_number_list(value: str) -> list[float]:
+    """Parse "1,2,4" into a list of positive numbers."""
+    try:
+        numbers = [float(part) for part in value.split(",") if part.strip()]
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected a comma separated list of numbers, got {value!r}"
+        ) from None
+
+    if not numbers or any(n <= 0 for n in numbers):
+        raise argparse.ArgumentTypeError("numbers must be positive")
+    return numbers
 
 
 def cool_down(target_c: float | None) -> None:
@@ -922,6 +937,69 @@ def cmd_offload_table(args: argparse.Namespace) -> int:
     return 0
 
 
+def short_option(row: pd.Series) -> str:
+    """An option's name cut down to fit a table cell."""
+    if row["useful"] == 0:
+        return "nothing fits"
+    if row["mode"] == "offload":
+        return "offload"
+    exit_number = EXIT_NAMES.index(row["point"]) + 1
+    if row["mode"] == "split":
+        return f"split after {exit_number}"
+    if exit_number == len(EXIT_NAMES):
+        return f"local {row['device_precision']}"
+    return f"{row['device_precision']} exit {exit_number}"
+
+
+def cmd_decide_map(args: argparse.Namespace) -> int:
+    """Name the best single option for every device speed, network and deadline."""
+    stem = Path(args.checkpoint).stem
+    results = Path(args.results)
+    try:
+        components = load_components(results, stem, threads=args.threads, servers=SERVERS)
+    except FileNotFoundError as error:
+        console.print(f"[bold red]Missing profile:[/bold red] {error.filename}")
+        return 1
+
+    options, best = decision_map(
+        components,
+        slowdowns=args.slowdowns,
+        deadlines=args.deadlines,
+        tie_margin=args.tie_margin,
+    )
+
+    # One cell per scenario: the winning option, then the percentage of frames
+    # it answers correctly in time, then in brackets the percentage reachable
+    # by choosing per frame.
+    shown = best[best["server"] == args.server]
+    table = Table(
+        title=f"Best single option by deadline, server {args.server}\n"
+        "% of frames correct in time (best possible per frame)",
+        padding=(0, 1),
+    )
+    table.add_column("device")
+    table.add_column("network")
+    for deadline in args.deadlines:
+        table.add_column(f"{deadline:g} ms")
+    for slowdown, speed in shown.groupby("slowdown", sort=False):
+        for index, (network, rows) in enumerate(speed.groupby("network", sort=False)):
+            cells = [
+                f"{short_option(row)}\n{row['useful'] * 100:.2f} ({row['best_possible'] * 100:.2f})"
+                for _, row in rows.iterrows()
+            ]
+            last = index == speed["network"].nunique() - 1
+            table.add_row(
+                f"{slowdown:g}x" if index == 0 else "", str(network), *cells, end_section=last
+            )
+    console.print(table)
+
+    outputs = {f"decide_options_{stem}.csv": options, f"decide_map_{stem}.csv": best}
+    for filename, frame in outputs.items():
+        frame.to_csv(results / filename, index=False)
+        console.print(f"Wrote [bold]{results / filename}[/bold] ({len(frame)} rows)")
+    return 0
+
+
 def cmd_exits_sweep(args: argparse.Namespace) -> int:
     """Exit vectors and a confidence-threshold sweep from a recorded profile."""
     profile = Path(args.profile)
@@ -1332,6 +1410,46 @@ def build_parser() -> argparse.ArgumentParser:
     )
     offload_table.add_argument("--results", default=str(RESULTS_DIR), help="profile directory")
     offload_table.set_defaults(func=cmd_offload_table)
+
+    decide = subparsers.add_parser("decide", help="which option is best, and when")
+    decide_sub = decide.add_subparsers(dest="decide_command", required=True)
+    decide_map = decide_sub.add_parser(
+        "map", help="best single option per device speed, network and deadline"
+    )
+    decide_map.add_argument(
+        "--checkpoint",
+        default=str(CHECKPOINT_DIR / "resnet18_early_exit_imagenette.pt"),
+        help="names the profiles to join; the file itself is not read",
+    )
+    decide_map.add_argument(
+        "--threads", type=int, default=2, help="thread count of the device profiles"
+    )
+    decide_map.add_argument("--results", default=str(RESULTS_DIR), help="profile directory")
+    decide_map.add_argument(
+        "--server",
+        default="t4",
+        choices=sorted(SERVERS),
+        help="server shown in the printed table; the CSVs hold every server",
+    )
+    decide_map.add_argument(
+        "--slowdowns",
+        type=parse_number_list,
+        default=list(SLOWDOWNS),
+        help="how many times slower than the profiled device, comma separated",
+    )
+    decide_map.add_argument(
+        "--deadlines",
+        type=parse_number_list,
+        default=list(DEADLINES_MS),
+        help="deadlines in ms, comma separated",
+    )
+    decide_map.add_argument(
+        "--tie-margin",
+        type=float,
+        default=TIE_MARGIN,
+        help="options within this share of the top score tie, and the fastest wins",
+    )
+    decide_map.set_defaults(func=cmd_decide_map)
 
     bench = subparsers.add_parser("bench", help="measure forward pass latency")
     bench.add_argument("--backbone", default="resnet18", choices=SUPPORTED_BACKBONES)
