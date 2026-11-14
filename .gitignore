@@ -466,4 +466,10 @@ papers/*
 #   machine-readable and lands in results/; a plain .log would only ever be
 #   scratch output, which is exactly what should stay untracked.
 
+# Per-frame traces
+#   `edge decide evaluate` writes one row per frame per rule. A trace is rebuilt
+#   in seconds from the committed profiles and the seed recorded in its
+#   scoreboard, which is what stays tracked.
+results/decide_trace_*.csv.gz
+
 ### End of project-specific ###

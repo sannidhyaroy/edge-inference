@@ -8,6 +8,7 @@ import argparse
 import os
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import torch
 from rich.console import Console
@@ -27,6 +28,7 @@ from edge_inference.config import (
     IMAGE_SIZE,
     NUM_CLASSES,
     RESULTS_DIR,
+    SEED,
     seed_everything,
 )
 from edge_inference.data import build_dataloader, image_files, load_split
@@ -58,6 +60,7 @@ from edge_inference.offload import (
     load_components,
     summarise,
 )
+from edge_inference.policies import simple_rules
 from edge_inference.profiling import operations_per_exit, profile_model
 from edge_inference.quantization import (
     DataLoaderCalibrationReader,
@@ -66,8 +69,18 @@ from edge_inference.quantization import (
     quantize_onnx,
 )
 from edge_inference.server import OnnxServer, TorchServer, profile_server
+from edge_inference.simulate import (
+    Measurements,
+    Scenario,
+    frame_stream,
+    markov_states,
+    score_trace,
+    simulate,
+    split_images,
+)
 from edge_inference.split import profile_splits
 from edge_inference.training import fine_tune
+from edge_inference.yardsticks import ladder
 
 console = Console()
 
@@ -1000,6 +1013,110 @@ def cmd_decide_map(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_decide_evaluate(args: argparse.Namespace) -> int:
+    """Run every rule over the same frames and networks, next to the yardsticks."""
+    stem = Path(args.checkpoint).stem
+    results = Path(args.results)
+    try:
+        components = load_components(results, stem, threads=args.threads, servers=SERVERS)
+    except FileNotFoundError as error:
+        console.print(f"[bold red]Missing profile:[/bold red] {error.filename}")
+        return 1
+
+    table = Measurements.from_components(components, args.server)
+    if args.tune_share > 0:
+        tuning_images = split_images(table.labels, args.tune_share, args.seed)
+        tuning, test = table.subset(tuning_images), table.subset(~tuning_images)
+    else:
+        # Useful for reproducing whole-set figures; settings are then chosen on
+        # the images they are scored on, which flatters any tuned rule.
+        tuning = test = table
+        console.print(
+            "[yellow]No tuning images held out: tuned rules are scored optimistically.[/]"
+        )
+
+    frames = frame_stream(len(test), args.passes * len(test), args.seed)
+    if args.good == args.bad:
+        names, states = [args.good], np.zeros(len(frames), dtype=int)
+    else:
+        names = [args.good, args.bad]
+        states = markov_states(len(frames), (args.stay_good, args.stay_bad), args.seed)
+    networks = [NETWORKS[name] for name in names]
+    scenario = Scenario(
+        test, frames, states, networks, names, slowdown=args.slowdown, deadline_ms=args.deadline
+    )
+
+    rules = simple_rules(tuning, networks[0], slowdown=args.slowdown, deadline_ms=args.deadline)
+    rows, traces = [], []
+    for rule in rules:
+        trace = simulate(rule, scenario, args.knowledge)
+        traces.append(trace.assign(rule=rule.name))
+        rows.append(
+            {
+                "rule": rule.name,
+                "kind": "rule",
+                "plans": rule.plan.describe(),
+                **score_trace(trace, args.deadline),
+            }
+        )
+    board = pd.concat([pd.DataFrame(rows), ladder(scenario)], ignore_index=True)
+    # Rung 3 is the fair target: the best any rule deciding from the network
+    # and confidence could have done on these frames.
+    fair = board.loc[board["rule"].str.startswith("3."), "useful"].iloc[0]
+    board["behind_fair"] = fair - board["useful"]
+
+    shares = ", ".join(
+        f"{name} {np.mean(states == index) * 100:.0f}%" for index, name in enumerate(names)
+    )
+    console.print(
+        f"{len(frames)} frames from {len(test)} test images; device {args.slowdown:g}x slower; "
+        f"deadline {args.deadline:g} ms; server {args.server}; network {shares}; "
+        f"rules know the network: {args.knowledge}"
+    )
+    shown = Table(title="% of frames answered correctly in time, and what it cost")
+    for column in ("rule", "useful", "behind", "accuracy", "in time", "mean ms", "p95 ms", "sent"):
+        shown.add_column(column, justify="left" if column == "rule" else "right")
+    for index, row in board.iterrows():
+        last_rule = index == len(rows) - 1
+        shown.add_row(
+            row["rule"],
+            f"{row['useful'] * 100:.2f}",
+            f"{row['behind_fair'] * 100:+.2f}".replace("+", "") if row["kind"] == "rule" else "",
+            f"{row['accuracy'] * 100:.2f}",
+            f"{row['on_time'] * 100:.2f}",
+            f"{row['mean_ms']:.2f}",
+            f"{row['p95_ms']:.2f}",
+            f"{row['sent_share'] * 100:.0f}%",
+            end_section=last_rule,
+        )
+    console.print(shown)
+    for _, row in board[board["kind"] == "yardstick"].iloc[:3].iterrows():
+        console.print(f"  {row['rule']}: {row['plans']}")
+
+    setting = {
+        "server": args.server,
+        "slowdown": args.slowdown,
+        "deadline_ms": args.deadline,
+        "good": names[0],
+        "bad": names[-1],
+        "stay_good": args.stay_good,
+        "stay_bad": args.stay_bad,
+        "knowledge": args.knowledge,
+        "frames": len(frames),
+        "passes": args.passes,
+        "seed": args.seed,
+    }
+    tag = f"{stem}_{args.server}_{args.slowdown:g}x_{args.deadline:g}ms_{names[0]}-{names[-1]}"
+    outputs = {
+        f"decide_scoreboard_{tag}.csv": board.assign(**setting),
+        f"decide_trace_{tag}.csv.gz": pd.concat(traces, ignore_index=True),
+    }
+    for filename, frame in outputs.items():
+        frame.to_csv(results / filename, index=False)
+        console.print(f"Wrote [bold]{results / filename}[/bold] ({len(frame)} rows)")
+    return 0
+
+
 def cmd_exits_sweep(args: argparse.Namespace) -> int:
     """Exit vectors and a confidence-threshold sweep from a recorded profile."""
     profile = Path(args.profile)
@@ -1450,6 +1567,57 @@ def build_parser() -> argparse.ArgumentParser:
         help="options within this share of the top score tie, and the fastest wins",
     )
     decide_map.set_defaults(func=cmd_decide_map)
+
+    decide_evaluate = decide_sub.add_parser(
+        "evaluate", help="score rules on a stream of frames under a changing network"
+    )
+    decide_evaluate.add_argument(
+        "--checkpoint",
+        default=str(CHECKPOINT_DIR / "resnet18_early_exit_imagenette.pt"),
+        help="names the profiles to join; the file itself is not read",
+    )
+    decide_evaluate.add_argument(
+        "--threads", type=int, default=2, help="thread count of the device profiles"
+    )
+    decide_evaluate.add_argument("--results", default=str(RESULTS_DIR), help="profile directory")
+    decide_evaluate.add_argument("--server", default="t4", choices=sorted(SERVERS))
+    decide_evaluate.add_argument(
+        "--slowdown", type=float, default=8.0, help="times slower than the profiled device"
+    )
+    decide_evaluate.add_argument("--deadline", type=float, default=30.0, help="deadline in ms")
+    decide_evaluate.add_argument("--good", default="wifi", choices=sorted(NETWORKS))
+    decide_evaluate.add_argument(
+        "--bad",
+        default="4g",
+        choices=sorted(NETWORKS),
+        help="the same as --good gives a steady network",
+    )
+    decide_evaluate.add_argument(
+        "--stay-good",
+        type=float,
+        default=0.95,
+        help="chance the good network lasts another frame (0.95 is 20 frames on average)",
+    )
+    decide_evaluate.add_argument("--stay-bad", type=float, default=0.95)
+    decide_evaluate.add_argument(
+        "--knowledge",
+        default="exact",
+        help="what rules know of the network: exact, probe:N (every N frames) or sends",
+    )
+    decide_evaluate.add_argument(
+        "--passes",
+        type=int,
+        default=5,
+        help="times each test image is shown; more passes steady the share of each network",
+    )
+    decide_evaluate.add_argument(
+        "--tune-share",
+        type=float,
+        default=0.5,
+        help="share of each class held out for choosing settings; 0 scores every image",
+    )
+    decide_evaluate.add_argument("--seed", type=int, default=SEED)
+    decide_evaluate.set_defaults(func=cmd_decide_evaluate)
 
     bench = subparsers.add_parser("bench", help="measure forward pass latency")
     bench.add_argument("--backbone", default="resnet18", choices=SUPPORTED_BACKBONES)
