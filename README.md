@@ -30,6 +30,7 @@ imposes.
     - [Profile a server](#profile-a-server)
     - [Compare local, split and offload](#compare-local-split-and-offload)
     - [Find the best option per device and network](#find-the-best-option-per-device-and-network)
+    - [Score decision rules on a changing network](#score-decision-rules-on-a-changing-network)
 - [Training on a GPU machine](#training-on-a-gpu-machine)
     - [Getting a Colab runtime](#getting-a-colab-runtime)
     - [On the runtime](#on-the-runtime)
@@ -127,11 +128,14 @@ edge-inference/
 │   ├── export.py           ONNX export, per-stage export, parity checking
 │   ├── models.py           backbone construction, early-exit wrapper
 │   ├── offload.py          per-image cost of every mode, networks applied
+│   ├── policies.py         decision rules, and the plans they choose from
 │   ├── profiling.py        parameters, operations, cost per exit, size
 │   ├── quantization.py     static INT8 quantization and calibration
 │   ├── server.py           server-side time for every way a frame arrives
+│   ├── simulate.py         frames replayed under a changing network
 │   ├── split.py            what crosses the network at each split point
-│   └── training.py         fine-tuning and evaluation, single or multi-exit
+│   ├── training.py         fine-tuning and evaluation, single or multi-exit
+│   └── yardsticks.py       what a rule could have scored, at four levels of knowledge
 ├── app/main.py             browser demo comparing float32 and INT8
 ├── tests/                  sanity checks
 ├── papers/                 citations and licenses for the reference papers
@@ -569,6 +573,49 @@ of a percentage point by default, count as tied, and the fastest wins.
 > A slower device is modelled as the profiled one slowed by a constant factor
 > (`--slowdowns`), applied to everything the device computes. That is an
 > assumption. A real device has its own profile, which replaces the factor.
+
+### Score decision rules on a changing network
+
+```bash
+uv run edge decide evaluate
+```
+
+Replays the profiled images as a stream of frames while the network switches
+between a good and a bad state, and scores decision rules on it. No model
+runs: what happens to each frame is looked up in the per-image table. The
+defaults are the case where deciding matters most: a device 8 times slower
+than the one profiled, a 30 ms deadline, and a network that alternates between
+Wi-Fi and 4G, staying in each for 20 frames on average.
+
+A rule returns one plan per frame: send the photo, or run to some exit,
+stopping early where an exit is confident enough and optionally sending when
+it is not. **A rule is never told whether an answer was right**, only what a
+device in the field could see. What it knows of the network is set with
+`--knowledge`, because only sending reveals the network: `exact`, `probe:N`
+for a probe every N frames, or `sends` for what its own sends revealed.
+
+The scoreboard lists each rule above four yardsticks, computed on the same
+frames:
+
+| yardstick                           | what it is allowed to know             |
+| ----------------------------------- | -------------------------------------- |
+| best fixed option                   | nothing: one option for the whole run  |
+| best option per network             | the network, not the image             |
+| best confidence rule per network    | the network and each exit's confidence |
+| best possible per frame             | which options answer correctly         |
+
+Each is at least as good as the one above it. The third is the fair target for
+a rule, and the scoreboard's `behind` column is the distance to it. The last
+needs the answer in advance, so nothing can reach it.
+
+Settings such as thresholds are chosen on half of each class's images and
+everything is scored on the other half (`--tune-share`). Each test image is
+shown `--passes` times, five by default: on one pass the share of frames each
+network gets moves the scores by more than a point between seeds.
+
+The scoreboard goes to `results/decide_scoreboard_<scenario>.csv`. The
+per-frame trace next to it is not tracked, since it is rebuilt in seconds from
+the seed the scoreboard records.
 
 ---
 
