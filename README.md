@@ -29,6 +29,7 @@ imposes.
     - [Profile split payloads](#profile-split-payloads)
     - [Profile a server](#profile-a-server)
     - [Compare local, split and offload](#compare-local-split-and-offload)
+    - [Find the best option per device and network](#find-the-best-option-per-device-and-network)
 - [Training on a GPU machine](#training-on-a-gpu-machine)
     - [Getting a Colab runtime](#getting-a-colab-runtime)
     - [On the runtime](#on-the-runtime)
@@ -120,6 +121,7 @@ edge-inference/
 │   ├── cli.py              argparse entry point, exposed as the `edge` command
 │   ├── config.py           paths, seed, dataset constants
 │   ├── data.py             Imagenette loading and preprocessing
+│   ├── decide.py           best option per device speed, network and deadline
 │   ├── exit_analysis.py    exit vectors and confidence-threshold sweeps
 │   ├── exit_profiler.py    per-image latency and confidence at every exit
 │   ├── export.py           ONNX export, per-stage export, parity checking
@@ -542,6 +544,31 @@ profiled device a device must be before sending pays.
 > `offload.py`, not measurements. They are there to show the shape of the
 > trade-off, and should be replaced by a measured or modelled channel before
 > any conclusion depends on them.
+
+### Find the best option per device and network
+
+```bash
+uv run edge decide map
+```
+
+Reads the per-image table and, for every combination of device speed, network
+and deadline, names the single option that answers the most frames correctly in
+time. It writes one row per scenario to `results/decide_map_<checkpoint>.csv`,
+and the scores of every option in every scenario to
+`results/decide_options_<checkpoint>.csv`.
+
+Next to each winner is the **best possible per frame**: the share of frames for
+which some option would have been correct in time. Reaching it needs the
+correct answer in advance, so it is a ceiling to measure against, not a rule.
+
+Two options often differ by a frame or two out of thousands while one takes
+several times longer. Options within `--tie-margin` of the top score, a tenth
+of a percentage point by default, count as tied, and the fastest wins.
+
+> [!IMPORTANT]
+> A slower device is modelled as the profiled one slowed by a constant factor
+> (`--slowdowns`), applied to everything the device computes. That is an
+> assumption. A real device has its own profile, which replaces the factor.
 
 ---
 
