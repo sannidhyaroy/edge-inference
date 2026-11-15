@@ -31,6 +31,7 @@ imposes.
     - [Compare local, split and offload](#compare-local-split-and-offload)
     - [Find the best option per device and network](#find-the-best-option-per-device-and-network)
     - [Score decision rules on a changing network](#score-decision-rules-on-a-changing-network)
+    - [Sweep device speeds and deadlines](#sweep-device-speeds-and-deadlines)
 - [Training on a GPU machine](#training-on-a-gpu-machine)
     - [Getting a Colab runtime](#getting-a-colab-runtime)
     - [On the runtime](#on-the-runtime)
@@ -651,6 +652,22 @@ recovered.
 The scoreboard goes to `results/decide_scoreboard_<scenario>.csv`. The
 per-frame trace next to it is not tracked, since it is rebuilt in seconds from
 the seed the scoreboard records.
+
+### Sweep device speeds and deadlines
+
+```bash
+uv run edge decide sweep
+```
+
+One scenario shows what happened; a sweep shows where it holds. This scores
+the rules for every device speed in `--slowdowns` with every deadline in
+`--deadlines`, each under `--seeds` different seeds, several setups at a time
+(`--workers`). It prints the mean share of frames answered correctly in time
+per cell, with the spread of this project's rule across seeds, and writes every
+scoreboard stacked to `results/decide_sweep_<scenario>.csv`.
+
+To keep a sweep to minutes, only two SplitEE rows are run: as published, and
+with every repair at once.
 
 ---
 
