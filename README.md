@@ -118,6 +118,7 @@ Each of those choices exists for a reason:
 ```
 edge-inference/
 ├── src/edge_inference/
+│   ├── bandit.py           SplitEE's rule, as published and with assumptions repaired
 │   ├── bench.py            latency harness, hardware detection, thread pinning
 │   ├── cli.py              argparse entry point, exposed as the `edge` command
 │   ├── config.py           paths, seed, dataset constants
@@ -612,6 +613,25 @@ Settings such as thresholds are chosen on half of each class's images and
 everything is scored on the other half (`--tune-share`). Each test image is
 shown `--passes` times, five by default: on one pass the share of frames each
 network gets moves the scores by more than a point between seeds.
+
+**A published rule is on the scoreboard too.** SplitEE treats each exit as an
+arm of a bandit: run to that exit, answer if it is confident, otherwise send
+the feature map. It learns which arm pays best from a reward of confidence
+minus cost, with the cost counted in layers and one constant charged for
+sending. It is run as published, and again with one assumption changed at a
+time: a threshold per exit, the frame's measured time as the cost, a sliding
+window so that old frames are forgotten, and wider arms. The published arms
+are float32 exits that fall back on the feature map; the wider ones are INT8
+exits that fall back on the photo, plus an arm that sends the photo at once.
+One row applies every repair at once, the strongest form of the rule. A last
+row rewards the published rule with the right answer in place of
+confidence. No device could run that one; it shows what trusting confidence
+costs.
+
+Every variant's settings are chosen by running it on the tuning images under a
+network sequence the test never sees, keeping the settings that answer the
+most frames correctly in time. That is generous: the rule's own reward knows
+no deadline.
 
 The scoreboard goes to `results/decide_scoreboard_<scenario>.csv`. The
 per-frame trace next to it is not tracked, since it is rebuilt in seconds from
