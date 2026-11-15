@@ -366,32 +366,35 @@ class Variant:
         return [labels[arm] for arm in self.chosen]
 
 
-def variants(tuning: Scenario, test: Scenario) -> list[Variant]:
+def variants(tuning: Scenario, test: Scenario, *, every: bool = True) -> list[Variant]:
     """SplitEE as published, then with one assumption changed at a time.
 
     Every variant's settings are chosen on `tuning` and it is then run once,
-    from scratch, on `test`.
+    from scratch, on `test`. Without `every`, only the published rule and the
+    one with every repair are run, which is what a sweep over scenarios needs.
     """
-    published = best_settings(tuning, published_candidates())
-    measured = best_settings(tuning, measured_candidates())
-    windowed = best_settings(tuning, measured_candidates(windows=WINDOWS))
-    per_exit = best_settings(tuning, per_exit_candidates(published))
-    # The published arms are float32 and fall back on the feature map. This
-    # gives the same rule INT8 exits, the photo as the fallback, and an arm
-    # that sends the photo at once: the options the decision map found best.
+    # The published arms are float32 and fall back on the feature map. The
+    # wide arms are INT8 exits, the photo as the fallback, and an arm that
+    # sends the photo at once: the options the decision map found best.
     wide_arms = {"precision": "int8", "otherwise": PHOTO, "offload_arm": True}
-    wider = best_settings(tuning, measured_candidates(**wide_arms))
+    published = best_settings(tuning, published_candidates())
     repaired = best_settings(tuning, measured_candidates(windows=WINDOWS, **wide_arms))
-    rows = [
-        ("SplitEE as published", "rule", published, False),
-        ("SplitEE, a threshold per exit", "rule", per_exit, False),
-        ("SplitEE, measured cost", "rule", measured, False),
-        ("SplitEE, measured cost, sliding window", "rule", windowed, False),
-        ("SplitEE, measured cost, INT8 and photo arms", "rule", wider, False),
-        ("SplitEE, every repair at once", "rule", repaired, False),
+    rows = [("SplitEE as published", "rule", published, False)]
+    if every:
+        per_exit = best_settings(tuning, per_exit_candidates(published))
+        measured = best_settings(tuning, measured_candidates())
+        windowed = best_settings(tuning, measured_candidates(windows=WINDOWS))
+        wider = best_settings(tuning, measured_candidates(**wide_arms))
+        rows += [
+            ("SplitEE, a threshold per exit", "rule", per_exit, False),
+            ("SplitEE, measured cost", "rule", measured, False),
+            ("SplitEE, measured cost, sliding window", "rule", windowed, False),
+            ("SplitEE, measured cost, INT8 and photo arms", "rule", wider, False),
+        ]
+    rows.append(("SplitEE, every repair at once", "rule", repaired, False))
+    if every:
         # Not a rule a device could run: it is rewarded with the right answer.
-        ("SplitEE as published, told the answer", "diagnostic", published, True),
-    ]
+        rows.append(("SplitEE as published, told the answer", "diagnostic", published, True))
     return [
         Variant(name, kind, settings, *evaluate(test, settings, by_label=by_label))
         for name, kind, settings, by_label in rows
@@ -411,7 +414,9 @@ def offload_cost_in_layers(scenario: Scenario) -> dict[str, float]:
     sent = scenario.resolve(send_all)
     reach = scenario.resolve(Plan("float32", 0))
     extra = sent.total_ms - reach.total_ms
-    return {
-        name: float(np.median(extra[scenario.states == state]) / per_layer)
-        for state, name in enumerate(scenario.state_names)
-    }
+    costs = {}
+    for state, name in enumerate(scenario.state_names):
+        met = scenario.states == state
+        # A short run may never meet one of the networks.
+        costs[name] = float(np.median(extra[met]) / per_layer) if met.any() else math.nan
+    return costs
