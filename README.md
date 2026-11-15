@@ -132,6 +132,7 @@ edge-inference/
 │   ├── policies.py         decision rules, and the plans they choose from
 │   ├── profiling.py        parameters, operations, cost per exit, size
 │   ├── quantization.py     static INT8 quantization and calibration
+│   ├── scoreboard.py       every rule and yardstick on one scenario
 │   ├── server.py           server-side time for every way a frame arrives
 │   ├── simulate.py         frames replayed under a changing network
 │   ├── split.py            what crosses the network at each split point
@@ -632,6 +633,20 @@ Every variant's settings are chosen by running it on the tuning images under a
 network sequence the test never sees, keeping the settings that answer the
 most frames correctly in time. That is generous: the rule's own reward knows
 no deadline.
+
+**The last rule is this project's own.** It measures first and decides
+afterwards. For each network it tries every plan on the tuning images and
+keeps the one that answers the most frames correctly in time, or the fastest
+among near-ties. On each frame it takes the network as last seen and plays
+that network's plan, so deciding is a lookup. The scoreboard prints the plan
+it plays under each network and how long a decision takes.
+
+It is given more than SplitEE is: a measuring phase on labelled images, on the
+device, and a view of the network. Its lead also depends on that view being
+fresh. With `--knowledge sends` it learns the network only from the frames it
+sends, and it then sends one anyway whenever its last sighting has grown too
+old, since a rule that stops sending never finds out that the network
+recovered.
 
 The scoreboard goes to `results/decide_scoreboard_<scenario>.csv`. The
 per-frame trace next to it is not tracked, since it is rebuilt in seconds from
