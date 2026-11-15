@@ -14,6 +14,7 @@ import torch
 from rich.console import Console
 from rich.table import Table
 
+from edge_inference.bandit import offload_cost_in_layers, variants
 from edge_inference.bench import (
     benchmark_model,
     benchmark_session,
@@ -80,7 +81,7 @@ from edge_inference.simulate import (
 )
 from edge_inference.split import profile_splits
 from edge_inference.training import fine_tune
-from edge_inference.yardsticks import ladder
+from edge_inference.yardsticks import ladder_runs, score_run
 
 console = Console()
 
@@ -1035,16 +1036,44 @@ def cmd_decide_evaluate(args: argparse.Namespace) -> int:
             "[yellow]No tuning images held out: tuned rules are scored optimistically.[/]"
         )
 
-    frames = frame_stream(len(test), args.passes * len(test), args.seed)
-    if args.good == args.bad:
-        names, states = [args.good], np.zeros(len(frames), dtype=int)
-    else:
-        names = [args.good, args.bad]
-        states = markov_states(len(frames), (args.stay_good, args.stay_bad), args.seed)
+    def scenario_from(images: Measurements, seed: int) -> Scenario:
+        frames = frame_stream(len(images), args.passes * len(images), seed)
+        if args.good == args.bad:
+            states = np.zeros(len(frames), dtype=int)
+        else:
+            states = markov_states(len(frames), (args.stay_good, args.stay_bad), seed)
+        return Scenario(
+            images,
+            frames,
+            states,
+            networks,
+            names,
+            slowdown=args.slowdown,
+            deadline_ms=args.deadline,
+        )
+
+    names = [args.good] if args.good == args.bad else [args.good, args.bad]
     networks = [NETWORKS[name] for name in names]
-    scenario = Scenario(
-        test, frames, states, networks, names, slowdown=args.slowdown, deadline_ms=args.deadline
-    )
+    scenario = scenario_from(test, args.seed)
+    # Learning rules are tuned by running them, so they need a stream of their
+    # own: the tuning images, under a network sequence the test never sees.
+    tuning_scenario = scenario_from(tuning, args.seed + 1)
+    frames, states = scenario.frames, scenario.states
+
+    def as_trace(name: str, run: dict[str, np.ndarray]) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "frame": np.arange(len(frames)),
+                "image": scenario.measurements.images[frames],
+                "network": np.array(names)[states],
+                "sent_bytes": run["sent_bytes"],
+                "device_busy_ms": run["device_busy_ms"],
+                "total_ms": run["total_ms"],
+                "correct": run["correct"].astype(bool),
+                "useful": run["correct"].astype(bool) & (run["total_ms"] <= args.deadline),
+                "rule": name,
+            }
+        )
 
     rules = simple_rules(tuning, networks[0], slowdown=args.slowdown, deadline_ms=args.deadline)
     rows, traces = [], []
@@ -1059,11 +1088,27 @@ def cmd_decide_evaluate(args: argparse.Namespace) -> int:
                 **score_trace(trace, args.deadline),
             }
         )
-    board = pd.concat([pd.DataFrame(rows), ladder(scenario)], ignore_index=True)
+    for variant in variants(tuning_scenario, scenario):
+        traces.append(as_trace(variant.name, variant.outcome).assign(plan=variant.played()))
+        rows.append(
+            {
+                "rule": variant.name,
+                "kind": variant.kind,
+                "plans": variant.describe(),
+                **score_run(variant.outcome, args.deadline),
+            }
+        )
+    for name, plans, run in ladder_runs(scenario):
+        traces.append(as_trace(name, run))
+        rows.append(
+            {"rule": name, "kind": "yardstick", "plans": plans, **score_run(run, args.deadline)}
+        )
+    board = pd.DataFrame(rows)
     # Rung 3 is the fair target: the best any rule deciding from the network
     # and confidence could have done on these frames.
     fair = board.loc[board["rule"].str.startswith("3."), "useful"].iloc[0]
     board["behind_fair"] = fair - board["useful"]
+    in_layers = offload_cost_in_layers(scenario)
 
     shares = ", ".join(
         f"{name} {np.mean(states == index) * 100:.0f}%" for index, name in enumerate(names)
@@ -1076,22 +1121,27 @@ def cmd_decide_evaluate(args: argparse.Namespace) -> int:
     shown = Table(title="% of frames answered correctly in time, and what it cost")
     for column in ("rule", "useful", "behind", "accuracy", "in time", "mean ms", "p95 ms", "sent"):
         shown.add_column(column, justify="left" if column == "rule" else "right")
+    last_rule = board.index[board["kind"] != "yardstick"][-1]
     for index, row in board.iterrows():
-        last_rule = index == len(rows) - 1
         shown.add_row(
             row["rule"],
             f"{row['useful'] * 100:.2f}",
-            f"{row['behind_fair'] * 100:+.2f}".replace("+", "") if row["kind"] == "rule" else "",
+            f"{row['behind_fair'] * 100:.2f}" if row["kind"] != "yardstick" else "",
             f"{row['accuracy'] * 100:.2f}",
             f"{row['on_time'] * 100:.2f}",
             f"{row['mean_ms']:.2f}",
             f"{row['p95_ms']:.2f}",
             f"{row['sent_share'] * 100:.0f}%",
-            end_section=last_rule,
+            end_section=index == last_rule,
         )
     console.print(shown)
-    for _, row in board[board["kind"] == "yardstick"].iloc[:3].iterrows():
+    for _, row in board[board["plans"] != "chosen per frame"].iloc[len(rules) :].iterrows():
         console.print(f"  {row['rule']}: {row['plans']}")
+    console.print(
+        "  Sending features after exit 1 costs, in layers of device work: "
+        + ", ".join(f"{name} {layers:.1f}" for name, layers in in_layers.items())
+        + " (the paper assumes 1 to 5)"
+    )
 
     setting = {
         "server": args.server,
@@ -1105,8 +1155,11 @@ def cmd_decide_evaluate(args: argparse.Namespace) -> int:
         "frames": len(frames),
         "passes": args.passes,
         "seed": args.seed,
+        **{f"offload_layers_{name}": layers for name, layers in in_layers.items()},
     }
     tag = f"{stem}_{args.server}_{args.slowdown:g}x_{args.deadline:g}ms_{names[0]}-{names[-1]}"
+    if len(names) > 1:
+        tag += f"_stay{args.stay_good:g}-{args.stay_bad:g}"
     outputs = {
         f"decide_scoreboard_{tag}.csv": board.assign(**setting),
         f"decide_trace_{tag}.csv.gz": pd.concat(traces, ignore_index=True),
