@@ -67,7 +67,7 @@ from edge_inference.quantization import (
     quantize_exit_stages,
     quantize_onnx,
 )
-from edge_inference.scoreboard import OURS, Setup, run_setup
+from edge_inference.scoreboard import FAIR_TARGET, OURS, Setup, grid, run_setup, run_sweep
 from edge_inference.server import OnnxServer, TorchServer, profile_server
 from edge_inference.simulate import (
     Measurements,
@@ -1084,6 +1084,78 @@ def cmd_decide_evaluate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_decide_sweep(args: argparse.Namespace) -> int:
+    """Score the rules across device speeds and deadlines, several seeds each."""
+    stem = Path(args.checkpoint).stem
+    results = Path(args.results)
+    try:
+        components = load_components(results, stem, threads=args.threads, servers=SERVERS)
+    except FileNotFoundError as error:
+        console.print(f"[bold red]Missing profile:[/bold red] {error.filename}")
+        return 1
+
+    base = Setup(
+        server=args.server,
+        good=args.good,
+        bad=args.bad,
+        stay_good=args.stay,
+        stay_bad=args.stay,
+        knowledge=args.knowledge,
+        passes=args.passes,
+        seed=args.seed,
+    )
+    setups = grid(base, slowdowns=args.slowdowns, deadlines=args.deadlines, seeds=args.seeds)
+    console.print(f"Scoring {len(setups)} setups on {args.workers} processes")
+    boards = run_sweep(Measurements.from_components(components, args.server), setups, args.workers)
+
+    # Mean over seeds of the useful share, per device speed and deadline.
+    shown = {
+        "SplitEE as published": "SplitEE",
+        "SplitEE, every repair at once": "repaired",
+        OURS: "ours",
+        "1. best fixed option": "best fixed",
+        FAIR_TARGET: "fair target",
+    }
+    useful = (
+        boards[boards["rule"].isin(shown)]
+        .groupby(["slowdown", "deadline_ms", "rule"], sort=False)["useful"]
+        .agg(["mean", "std"])
+    )
+    table = Table(
+        title=f"% of frames correct in time, mean of {args.seeds} seeds "
+        f"({args.good} and {args.bad}, rules know the network: {args.knowledge})"
+    )
+    table.add_column("device")
+    table.add_column("deadline")
+    for label in shown.values():
+        table.add_column(label, justify="right")
+    table.add_column("ours, spread", justify="right")
+    for slowdown in args.slowdowns:
+        for index, deadline in enumerate(args.deadlines):
+            cells = [
+                f"{useful.loc[(slowdown, deadline, rule), 'mean'] * 100:.2f}" for rule in shown
+            ]
+            spread = useful.loc[(slowdown, deadline, OURS), "std"] * 100
+            table.add_row(
+                f"{slowdown:g}x" if index == 0 else "",
+                f"{deadline:g} ms",
+                *cells,
+                f"±{spread:.2f}",
+                end_section=index == len(args.deadlines) - 1,
+            )
+    console.print(table)
+
+    tag = f"{stem}_{args.server}_{args.good}-{args.bad}"
+    if args.good != args.bad:
+        tag += f"_stay{args.stay:g}"
+    if args.knowledge != "exact":
+        tag += f"_{args.knowledge.replace(':', '')}"
+    out = results / f"decide_sweep_{tag}.csv"
+    boards.to_csv(out, index=False)
+    console.print(f"Wrote [bold]{out}[/bold] ({len(boards)} rows)")
+    return 0
+
+
 def cmd_exits_sweep(args: argparse.Namespace) -> int:
     """Exit vectors and a confidence-threshold sweep from a recorded profile."""
     profile = Path(args.profile)
@@ -1585,6 +1657,44 @@ def build_parser() -> argparse.ArgumentParser:
     )
     decide_evaluate.add_argument("--seed", type=int, default=SEED)
     decide_evaluate.set_defaults(func=cmd_decide_evaluate)
+
+    decide_sweep = decide_sub.add_parser(
+        "sweep", help="score the rules across device speeds and deadlines, several seeds each"
+    )
+    decide_sweep.add_argument(
+        "--checkpoint",
+        default=str(CHECKPOINT_DIR / "resnet18_early_exit_imagenette.pt"),
+        help="names the profiles to join; the file itself is not read",
+    )
+    decide_sweep.add_argument(
+        "--threads", type=int, default=2, help="thread count of the device profiles"
+    )
+    decide_sweep.add_argument("--results", default=str(RESULTS_DIR), help="profile directory")
+    decide_sweep.add_argument("--server", default="t4", choices=sorted(SERVERS))
+    decide_sweep.add_argument("--slowdowns", type=parse_number_list, default=[2.0, 4.0, 8.0, 16.0])
+    decide_sweep.add_argument(
+        "--deadlines", type=parse_number_list, default=[20.0, 30.0, 50.0, 100.0]
+    )
+    decide_sweep.add_argument("--good", default="wifi", choices=sorted(NETWORKS))
+    decide_sweep.add_argument("--bad", default="4g", choices=sorted(NETWORKS))
+    decide_sweep.add_argument(
+        "--stay", type=float, default=0.95, help="chance a network state lasts another frame"
+    )
+    decide_sweep.add_argument(
+        "--knowledge", default="exact", help="exact, probe:N (every N frames) or sends"
+    )
+    decide_sweep.add_argument("--passes", type=int, default=5)
+    decide_sweep.add_argument(
+        "--seeds", type=int, default=3, help="runs per setup, each with its own seed"
+    )
+    decide_sweep.add_argument("--seed", type=int, default=SEED)
+    decide_sweep.add_argument(
+        "--workers",
+        type=int,
+        default=max(1, (os.cpu_count() or 2) // 2),
+        help="setups scored at once (default: half the logical cores)",
+    )
+    decide_sweep.set_defaults(func=cmd_decide_sweep)
 
     bench = subparsers.add_parser("bench", help="measure forward pass latency")
     bench.add_argument("--backbone", default="resnet18", choices=SUPPORTED_BACKBONES)

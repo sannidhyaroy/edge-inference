@@ -5,10 +5,17 @@ the deadline, the two networks and how long each lasts, what rules know of the
 network, and the seed. `run_setup` builds the frames from it, tunes each rule
 on images and a network sequence the test never sees, runs them, and returns
 the scoreboard with one row per rule and per yardstick.
+
+`run_sweep` does that for many setups at once, one process per core, and
+stacks the scoreboards. One scenario shows what happened; a sweep over device
+speeds, deadlines and seeds shows where it holds.
 """
 
 import time
-from dataclasses import asdict, dataclass
+from collections.abc import Sequence
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import asdict, dataclass, replace
+from itertools import product
 
 import numpy as np
 import pandas as pd
@@ -214,3 +221,48 @@ def run_setup(table: Measurements, setup: Setup, *, every_variant: bool = True) 
         test_images=len(test),
         held_out=setup.tune_share > 0,
     )
+
+
+def grid(
+    base: Setup,
+    *,
+    slowdowns: Sequence[float],
+    deadlines: Sequence[float],
+    seeds: int,
+) -> list[Setup]:
+    """Every device speed with every deadline, each under `seeds` different seeds.
+
+    Seeds are spaced well apart: a setup tunes on the seed after its own, and
+    neighbouring runs should not share a network sequence.
+    """
+    return [
+        replace(base, slowdown=slowdown, deadline_ms=deadline, seed=base.seed + 1000 * index)
+        for slowdown, deadline, index in product(slowdowns, deadlines, range(seeds))
+    ]
+
+
+_TABLE: Measurements | None = None
+
+
+def _share_table(table: Measurements) -> None:
+    global _TABLE
+    _TABLE = table
+
+
+def _board(setup: Setup) -> pd.DataFrame:
+    return run_setup(_TABLE, setup, every_variant=False).board
+
+
+def run_sweep(table: Measurements, setups: Sequence[Setup], workers: int = 1) -> pd.DataFrame:
+    """Score every setup and stack the scoreboards, `workers` setups at a time.
+
+    Only SplitEE as published and with every repair are run, since tuning all
+    of its variants takes most of a scoreboard's time.
+    """
+    if workers <= 1:
+        _share_table(table)
+        boards = [_board(setup) for setup in setups]
+    else:
+        with ProcessPoolExecutor(workers, initializer=_share_table, initargs=(table,)) as pool:
+            boards = list(pool.map(_board, setups))
+    return pd.concat(boards, ignore_index=True)

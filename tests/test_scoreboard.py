@@ -3,7 +3,7 @@
 import numpy as np
 
 from builders import measurements
-from edge_inference.scoreboard import FAIR_TARGET, OURS, Setup, run_setup
+from edge_inference.scoreboard import FAIR_TARGET, OURS, Setup, grid, run_setup, run_sweep
 
 
 def board_for(**settings):
@@ -79,3 +79,29 @@ def test_scoring_every_image_is_flagged():
 
     assert not result.held_out
     assert result.test_images == 4
+
+
+def test_a_grid_crosses_speeds_deadlines_and_seeds():
+    setups = grid(Setup(seed=7), slowdowns=(2, 8), deadlines=(30, 50, 100), seeds=2)
+
+    assert len(setups) == 2 * 3 * 2
+    assert {(s.slowdown, s.deadline_ms) for s in setups} == {
+        (2, 30),
+        (2, 50),
+        (2, 100),
+        (8, 30),
+        (8, 50),
+        (8, 100),
+    }
+    assert sorted({s.seed for s in setups}) == [7, 1007]
+
+
+def test_a_sweep_stacks_one_scoreboard_per_setup():
+    base = Setup(slowdown=1.0, deadline_ms=20.0, passes=10, seed=0)
+    setups = grid(base, slowdowns=(1, 3), deadlines=(20,), seeds=1)
+    boards = run_sweep(measurements(), setups)
+
+    # 5 simple rules, 2 SplitEE variants, ours and 4 yardsticks in each.
+    assert len(boards) == 2 * 12
+    assert sorted(boards["slowdown"].unique()) == [1, 3]
+    assert (boards.groupby("slowdown")["rule"].nunique() == 12).all()
