@@ -3,18 +3,21 @@
 import numpy as np
 
 from builders import NETWORK, measurements
+from edge_inference.offload import Network
 from edge_inference.policies import (
     OFFLOAD,
     Always,
+    Lookup,
     best_plan,
     fixed_plans,
     plan_family,
     simple_rules,
     tuned_threshold,
 )
-from edge_inference.simulate import FINAL, Plan, resolve
+from edge_inference.simulate import FINAL, Plan, View, resolve
 
 ROWS = np.arange(4)
+BAD = Network(rtt_ms=100, uplink_mbps=8)
 
 
 def behaviour(plan):
@@ -77,3 +80,45 @@ def test_the_baselines_are_named():
         "always offload",
     ]
     assert len(rules) == 5
+
+
+def lookup(**settings):
+    return Lookup("lookup", measurements(), slowdown=3.0, **settings)
+
+
+def test_the_lookup_rule_plays_a_different_plan_per_network():
+    rule = lookup()
+
+    # At 3x with 16 ms the photo (15 ms) is in time on the good network and
+    # right on all four images. On the bad network nothing sent is in time,
+    # and running int8 to the end is right on three.
+    assert rule.plan_for(NETWORK, deadline_ms=16) == OFFLOAD
+    local = rule.plan_for(BAD, deadline_ms=16)
+    assert local.precision == "int8" and local.depth == FINAL
+
+    outcome = resolve(measurements(), local, ROWS, BAD.rtt_ms, BAD.uplink_mbps, 3.0)
+    assert outcome.correct.mean() == 0.75
+    # Among plans that tie, the fastest wins: it stops early where it is sure.
+    assert outcome.total_ms.mean() < 9.0
+    assert (outcome.sent_bytes == 0).all()
+
+
+def test_the_lookup_rule_works_each_network_out_once():
+    rule = lookup()
+    for _ in range(3):
+        rule.choose(View(0, 16, NETWORK, network_age=0))
+        rule.choose(View(0, 16, BAD, network_age=0))
+
+    assert len(rule.table) == 2
+
+
+def test_the_lookup_rule_sends_when_it_knows_nothing_or_too_little():
+    rule = lookup(probe_every=5)
+    local = rule.plan_for(BAD, deadline_ms=16)
+
+    assert rule.choose(View(0, 16, None, network_age=0)) == OFFLOAD
+    assert rule.choose(View(9, 16, BAD, network_age=4)) == local
+    # The last sighting is five frames old: send a frame to look again.
+    assert rule.choose(View(10, 16, BAD, network_age=5)) == OFFLOAD
+    # Without probing it trusts an old sighting forever.
+    assert lookup().choose(View(10, 16, BAD, network_age=500)) == local

@@ -22,7 +22,7 @@ rule.
 
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import product
 
 import numpy as np
@@ -154,3 +154,55 @@ def simple_rules(
         for precision in PRECISIONS
     ]
     return rules
+
+
+@dataclass
+class Lookup:
+    """Measure first, then look the answer up.
+
+    Before each frame the rule takes the network as it last saw it and plays
+    the plan that did best under that network on the tuning images: the most
+    useful, and among near-ties the fastest. The plan comes from the whole
+    family, so it carries a threshold per exit and may fall back on sending
+    the photo or the feature map.
+
+    It needs what a bandit does not: a measuring phase on labelled images, on
+    this device. In return it changes its choice the moment the network does.
+
+    A rule that only learns the network by sending can get stuck: once it
+    believes the network is bad it stops sending, and so never finds out that
+    it recovered. With `probe_every`, a frame is sent anyway once the last
+    sighting of the network is that many frames old. A frame is also sent when
+    nothing is known at all, since sending both answers and reveals.
+    """
+
+    name: str
+    tuning: Measurements
+    slowdown: float
+    plans: Sequence[Plan] = field(default_factory=plan_family)
+    tie_margin: float = TIE_MARGIN
+    probe_every: int | None = None
+    table: dict[tuple[float, float, float], Plan] = field(default_factory=dict)
+
+    def plan_for(self, network: Network, deadline_ms: float) -> Plan:
+        """The plan to play under `network`, worked out once and then remembered."""
+        key = (network.rtt_ms, network.uplink_mbps, deadline_ms)
+        if key not in self.table:
+            self.table[key] = best_plan(
+                self.tuning,
+                self.plans,
+                network,
+                slowdown=self.slowdown,
+                deadline_ms=deadline_ms,
+                tie_margin=self.tie_margin,
+            )
+        return self.table[key]
+
+    def choose(self, view: View) -> Plan:
+        stale = self.probe_every is not None and view.network_age >= self.probe_every
+        if view.network is None or stale:
+            return OFFLOAD
+        return self.plan_for(view.network, view.deadline_ms)
+
+    def observe(self, feedback: Feedback) -> None:
+        pass
