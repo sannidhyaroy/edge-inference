@@ -176,6 +176,8 @@ class Outcome:
     answered_at: np.ndarray
     # Confidence at each exit the device reached; NaN for exits it did not.
     confidences: np.ndarray
+    # Confidence the server reports with its answer; NaN when nothing was sent.
+    server_confidence: np.ndarray
 
 
 def resolve(
@@ -192,6 +194,10 @@ def resolve(
     # `Network` only does arithmetic, so it takes one value per frame as well.
     network = Network(rtt_ms=rtt_ms, uplink_mbps=uplink_mbps)
     no_exit = np.full((count, len(EXIT_NAMES)), np.nan)
+    # The profiles did not record the server's confidence. The server runs the
+    # float32 network to its final exit, so the device's own confidence there
+    # stands in for it.
+    from_server = measurements.confidence["float32"][rows, FINAL]
 
     if plan.precision is None:
         size = measurements.photo_bytes[rows]
@@ -202,6 +208,7 @@ def resolve(
             sent_bytes=size,
             answered_at=np.full(count, -1),
             confidences=no_exit,
+            server_confidence=from_server,
         )
 
     depth = plan.depth
@@ -241,7 +248,15 @@ def resolve(
     confidences = no_exit
     confidences[:, : depth + 1] = reached
     confidences[np.arange(len(EXIT_NAMES)) > stopped[:, None]] = np.nan
-    return Outcome(total, correct.astype(bool), busy, sent_bytes, answered_at, confidences)
+    return Outcome(
+        total_ms=total,
+        correct=correct.astype(bool),
+        device_busy_ms=busy,
+        sent_bytes=sent_bytes,
+        answered_at=answered_at,
+        confidences=confidences,
+        server_confidence=np.where(sends, from_server, np.nan),
+    )
 
 
 def split_images(labels: np.ndarray, tune_share: float, seed: int) -> np.ndarray:
@@ -303,6 +318,8 @@ class Feedback:
     sent: bool
     answered_at: int
     confidences: tuple[float, ...]
+    # What the server said its confidence was; NaN when nothing was sent.
+    server_confidence: float
 
 
 class Rule(Protocol):
@@ -388,6 +405,7 @@ def simulate(rule: Rule, scenario: Scenario, knowledge: str = "exact") -> pd.Dat
                 sent=sent,
                 answered_at=int(outcome.answered_at[0]),
                 confidences=tuple(outcome.confidences[0]),
+                server_confidence=float(outcome.server_confidence[0]),
             )
         )
         rows.append(

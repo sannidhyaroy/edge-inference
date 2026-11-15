@@ -75,8 +75,10 @@ def _best_per_frame(scenario: Scenario) -> dict[str, np.ndarray]:
     return {name: np.stack([getattr(o, name) for o in outcomes])[pick, frames] for name in FIELDS}
 
 
-def ladder(scenario: Scenario, thresholds: Sequence[float] = THRESHOLDS) -> pd.DataFrame:
-    """Score the four yardsticks on a scenario, weakest first."""
+def ladder_runs(
+    scenario: Scenario, thresholds: Sequence[float] = THRESHOLDS
+) -> list[tuple[str, str, dict[str, np.ndarray]]]:
+    """The four yardsticks, weakest first: a name, what was chosen, and the run per frame."""
     whole_run = np.zeros(len(scenario.frames), dtype=int)
 
     def named(plans: Sequence[Plan]) -> str:
@@ -84,22 +86,38 @@ def ladder(scenario: Scenario, thresholds: Sequence[float] = THRESHOLDS) -> pd.D
             f"{scenario.state_names[state]}: {plan.describe()}" for state, plan in enumerate(plans)
         )
 
-    def row(name: str, plans: str, run: dict[str, np.ndarray]) -> dict[str, object]:
-        scores = score(
-            run["total_ms"],
-            run["correct"].astype(bool),
-            run["device_busy_ms"],
-            run["sent_bytes"],
-            scenario.deadline_ms,
-        )
-        return {"rule": name, "kind": "yardstick", "plans": plans, **scores}
+    (plan,), fixed = _best_per_group(scenario, fixed_plans(), whole_run)
+    per_state, by_network = _best_per_group(scenario, fixed_plans(), scenario.states)
+    family, by_confidence = _best_per_group(scenario, plan_family(thresholds), scenario.states)
+    return [
+        ("1. best fixed option", plan.describe(), fixed),
+        ("2. best option per network", named(per_state), by_network),
+        ("3. best confidence rule per network", named(family), by_confidence),
+        ("4. best possible per frame", "chosen per frame", _best_per_frame(scenario)),
+    ]
 
-    rows = []
-    (plan,), run = _best_per_group(scenario, fixed_plans(), whole_run)
-    rows.append(row("1. best fixed option", plan.describe(), run))
-    plans, run = _best_per_group(scenario, fixed_plans(), scenario.states)
-    rows.append(row("2. best option per network", named(plans), run))
-    plans, run = _best_per_group(scenario, plan_family(thresholds), scenario.states)
-    rows.append(row("3. best confidence rule per network", named(plans), run))
-    rows.append(row("4. best possible per frame", "chosen per frame", _best_per_frame(scenario)))
-    return pd.DataFrame(rows)
+
+def score_run(run: dict[str, np.ndarray], deadline_ms: float) -> dict[str, float]:
+    """`score` for a run held as one array per field."""
+    return score(
+        run["total_ms"],
+        run["correct"].astype(bool),
+        run["device_busy_ms"],
+        run["sent_bytes"],
+        deadline_ms,
+    )
+
+
+def ladder(scenario: Scenario, thresholds: Sequence[float] = THRESHOLDS) -> pd.DataFrame:
+    """Score the four yardsticks on a scenario, weakest first."""
+    return pd.DataFrame(
+        [
+            {
+                "rule": name,
+                "kind": "yardstick",
+                "plans": plans,
+                **score_run(run, scenario.deadline_ms),
+            }
+            for name, plans, run in ladder_runs(scenario, thresholds)
+        ]
+    )
