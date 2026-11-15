@@ -14,7 +14,6 @@ import torch
 from rich.console import Console
 from rich.table import Table
 
-from edge_inference.bandit import offload_cost_in_layers, variants
 from edge_inference.bench import (
     benchmark_model,
     benchmark_session,
@@ -61,7 +60,6 @@ from edge_inference.offload import (
     load_components,
     summarise,
 )
-from edge_inference.policies import simple_rules
 from edge_inference.profiling import operations_per_exit, profile_model
 from edge_inference.quantization import (
     DataLoaderCalibrationReader,
@@ -69,19 +67,13 @@ from edge_inference.quantization import (
     quantize_exit_stages,
     quantize_onnx,
 )
+from edge_inference.scoreboard import OURS, Setup, run_setup
 from edge_inference.server import OnnxServer, TorchServer, profile_server
 from edge_inference.simulate import (
     Measurements,
-    Scenario,
-    frame_stream,
-    markov_states,
-    score_trace,
-    simulate,
-    split_images,
 )
 from edge_inference.split import profile_splits
 from edge_inference.training import fine_tune
-from edge_inference.yardsticks import ladder_runs, score_run
 
 console = Console()
 
@@ -1024,99 +1016,34 @@ def cmd_decide_evaluate(args: argparse.Namespace) -> int:
         console.print(f"[bold red]Missing profile:[/bold red] {error.filename}")
         return 1
 
-    table = Measurements.from_components(components, args.server)
-    if args.tune_share > 0:
-        tuning_images = split_images(table.labels, args.tune_share, args.seed)
-        tuning, test = table.subset(tuning_images), table.subset(~tuning_images)
-    else:
-        # Useful for reproducing whole-set figures; settings are then chosen on
-        # the images they are scored on, which flatters any tuned rule.
-        tuning = test = table
+    setup = Setup(
+        server=args.server,
+        slowdown=args.slowdown,
+        deadline_ms=args.deadline,
+        good=args.good,
+        bad=args.bad,
+        stay_good=args.stay_good,
+        stay_bad=args.stay_bad,
+        knowledge=args.knowledge,
+        passes=args.passes,
+        tune_share=args.tune_share,
+        seed=args.seed,
+    )
+    result = run_setup(Measurements.from_components(components, args.server), setup)
+    board, scenario = result.board, result.scenario
+    if not result.held_out:
         console.print(
             "[yellow]No tuning images held out: tuned rules are scored optimistically.[/]"
         )
 
-    def scenario_from(images: Measurements, seed: int) -> Scenario:
-        frames = frame_stream(len(images), args.passes * len(images), seed)
-        if args.good == args.bad:
-            states = np.zeros(len(frames), dtype=int)
-        else:
-            states = markov_states(len(frames), (args.stay_good, args.stay_bad), seed)
-        return Scenario(
-            images,
-            frames,
-            states,
-            networks,
-            names,
-            slowdown=args.slowdown,
-            deadline_ms=args.deadline,
-        )
-
-    names = [args.good] if args.good == args.bad else [args.good, args.bad]
-    networks = [NETWORKS[name] for name in names]
-    scenario = scenario_from(test, args.seed)
-    # Learning rules are tuned by running them, so they need a stream of their
-    # own: the tuning images, under a network sequence the test never sees.
-    tuning_scenario = scenario_from(tuning, args.seed + 1)
-    frames, states = scenario.frames, scenario.states
-
-    def as_trace(name: str, run: dict[str, np.ndarray]) -> pd.DataFrame:
-        return pd.DataFrame(
-            {
-                "frame": np.arange(len(frames)),
-                "image": scenario.measurements.images[frames],
-                "network": np.array(names)[states],
-                "sent_bytes": run["sent_bytes"],
-                "device_busy_ms": run["device_busy_ms"],
-                "total_ms": run["total_ms"],
-                "correct": run["correct"].astype(bool),
-                "useful": run["correct"].astype(bool) & (run["total_ms"] <= args.deadline),
-                "rule": name,
-            }
-        )
-
-    rules = simple_rules(tuning, networks[0], slowdown=args.slowdown, deadline_ms=args.deadline)
-    rows, traces = [], []
-    for rule in rules:
-        trace = simulate(rule, scenario, args.knowledge)
-        traces.append(trace.assign(rule=rule.name))
-        rows.append(
-            {
-                "rule": rule.name,
-                "kind": "rule",
-                "plans": rule.plan.describe(),
-                **score_trace(trace, args.deadline),
-            }
-        )
-    for variant in variants(tuning_scenario, scenario):
-        traces.append(as_trace(variant.name, variant.outcome).assign(plan=variant.played()))
-        rows.append(
-            {
-                "rule": variant.name,
-                "kind": variant.kind,
-                "plans": variant.describe(),
-                **score_run(variant.outcome, args.deadline),
-            }
-        )
-    for name, plans, run in ladder_runs(scenario):
-        traces.append(as_trace(name, run))
-        rows.append(
-            {"rule": name, "kind": "yardstick", "plans": plans, **score_run(run, args.deadline)}
-        )
-    board = pd.DataFrame(rows)
-    # Rung 3 is the fair target: the best any rule deciding from the network
-    # and confidence could have done on these frames.
-    fair = board.loc[board["rule"].str.startswith("3."), "useful"].iloc[0]
-    board["behind_fair"] = fair - board["useful"]
-    in_layers = offload_cost_in_layers(scenario)
-
     shares = ", ".join(
-        f"{name} {np.mean(states == index) * 100:.0f}%" for index, name in enumerate(names)
+        f"{name} {np.mean(scenario.states == index) * 100:.0f}%"
+        for index, name in enumerate(setup.names)
     )
     console.print(
-        f"{len(frames)} frames from {len(test)} test images; device {args.slowdown:g}x slower; "
-        f"deadline {args.deadline:g} ms; server {args.server}; network {shares}; "
-        f"rules know the network: {args.knowledge}"
+        f"{len(scenario.frames)} frames from {result.test_images} test images; "
+        f"device {setup.slowdown:g}x slower; deadline {setup.deadline_ms:g} ms; "
+        f"server {setup.server}; network {shares}; rules know the network: {setup.knowledge}"
     )
     shown = Table(title="% of frames answered correctly in time, and what it cost")
     for column in ("rule", "useful", "behind", "accuracy", "in time", "mean ms", "p95 ms", "sent"):
@@ -1135,34 +1062,21 @@ def cmd_decide_evaluate(args: argparse.Namespace) -> int:
             end_section=index == last_rule,
         )
     console.print(shown)
-    for _, row in board[board["plans"] != "chosen per frame"].iloc[len(rules) :].iterrows():
+    described = board[(board["rule"].str.startswith(("SplitEE", OURS, "1.", "2.", "3.")))]
+    for _, row in described.iterrows():
         console.print(f"  {row['rule']}: {row['plans']}")
     console.print(
         "  Sending features after exit 1 costs, in layers of device work: "
-        + ", ".join(f"{name} {layers:.1f}" for name, layers in in_layers.items())
+        + ", ".join(f"{name} {board[f'offload_layers_{name}'].iloc[0]:.1f}" for name in setup.names)
         + " (the paper assumes 1 to 5)"
     )
+    decide_us = board.loc[board["rule"] == OURS, "decide_us"].iloc[0]
+    console.print(f"  {OURS} takes {decide_us:.2f} microseconds to decide on a frame")
 
-    setting = {
-        "server": args.server,
-        "slowdown": args.slowdown,
-        "deadline_ms": args.deadline,
-        "good": names[0],
-        "bad": names[-1],
-        "stay_good": args.stay_good,
-        "stay_bad": args.stay_bad,
-        "knowledge": args.knowledge,
-        "frames": len(frames),
-        "passes": args.passes,
-        "seed": args.seed,
-        **{f"offload_layers_{name}": layers for name, layers in in_layers.items()},
-    }
-    tag = f"{stem}_{args.server}_{args.slowdown:g}x_{args.deadline:g}ms_{names[0]}-{names[-1]}"
-    if len(names) > 1:
-        tag += f"_stay{args.stay_good:g}-{args.stay_bad:g}"
+    tag = f"{stem}_{setup.tag()}"
     outputs = {
-        f"decide_scoreboard_{tag}.csv": board.assign(**setting),
-        f"decide_trace_{tag}.csv.gz": pd.concat(traces, ignore_index=True),
+        f"decide_scoreboard_{tag}.csv": board,
+        f"decide_trace_{tag}.csv.gz": result.traces,
     }
     for filename, frame in outputs.items():
         frame.to_csv(results / filename, index=False)
