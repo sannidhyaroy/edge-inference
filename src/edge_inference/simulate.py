@@ -22,7 +22,7 @@ reveals nothing.
 """
 
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -374,8 +374,18 @@ def _probe_interval(knowledge: str) -> int | None:
     return int(interval)
 
 
-def simulate(rule: Rule, scenario: Scenario, knowledge: str = "exact") -> pd.DataFrame:
-    """Run one rule over the scenario's frames; return one row per frame."""
+def simulate(
+    rule: Rule,
+    scenario: Scenario,
+    knowledge: str = "exact",
+    execute: Callable[[Plan, int], Outcome] | None = None,
+) -> pd.DataFrame:
+    """Run one rule over the scenario's frames; return one row per frame.
+
+    By default a plan's outcome is looked up in the measurements. `execute`
+    replaces the lookup: given a plan and a frame's position it returns that
+    one frame's outcome, which is how a live run reuses this loop.
+    """
     interval = _probe_interval(knowledge)
     last_send: int | None = None
     rows = []
@@ -393,7 +403,10 @@ def simulate(rule: Rule, scenario: Scenario, knowledge: str = "exact") -> pd.Dat
             network_age=0 if seen is None else frame - seen,
         )
         plan = rule.choose(view)
-        outcome = scenario.resolve(plan, np.array([frame]))
+        if execute is None:
+            outcome = scenario.resolve(plan, np.array([frame]))
+        else:
+            outcome = execute(plan, frame)
         sent = bool(outcome.sent_bytes[0] > 0)
         if sent:
             last_send = frame
