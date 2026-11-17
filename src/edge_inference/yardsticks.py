@@ -10,8 +10,8 @@ the same networks the rules met.
    knows the network exactly, and nothing about the image.
 3. **Best confidence rule per network.** The best plan in the whole family for
    each network state, found by trying every one on these very frames. It
-   knows the network and each exit's confidence. This is the fair target: no
-   rule that decides from the network and confidence can do better.
+   knows the network and each exit's confidence. This is the fair target: the
+   best that playing one plan of the family per network state can do.
 4. **Best possible per frame.** The best plain option for each frame, chosen
    knowing which options answer it correctly. Unreachable, because it needs
    the answer in advance.
