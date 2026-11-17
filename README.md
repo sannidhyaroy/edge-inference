@@ -32,6 +32,7 @@ imposes.
     - [Find the best option per device and network](#find-the-best-option-per-device-and-network)
     - [Score decision rules on a changing network](#score-decision-rules-on-a-changing-network)
     - [Sweep device speeds and deadlines](#sweep-device-speeds-and-deadlines)
+    - [Run it for real](#run-it-for-real)
 - [Training on a GPU machine](#training-on-a-gpu-machine)
     - [Getting a Colab runtime](#getting-a-colab-runtime)
     - [On the runtime](#on-the-runtime)
@@ -133,6 +134,7 @@ edge-inference/
 │   ├── policies.py         decision rules, and the plans they choose from
 │   ├── profiling.py        parameters, operations, cost per exit, size
 │   ├── quantization.py     static INT8 quantization and calibration
+│   ├── runtime.py          a device and a server exchanging real bytes
 │   ├── scoreboard.py       every rule and yardstick on one scenario
 │   ├── server.py           server-side time for every way a frame arrives
 │   ├── simulate.py         frames replayed under a changing network
@@ -140,6 +142,7 @@ edge-inference/
 │   ├── training.py         fine-tuning and evaluation, single or multi-exit
 │   └── yardsticks.py       what a rule could have scored, at four levels of knowledge
 ├── app/main.py             browser demo comparing float32 and INT8
+├── scripts/                record_network.py: how a real link behaves over time
 ├── tests/                  sanity checks
 ├── papers/                 citations and licenses for the reference papers
 ├── results/                committed CSVs and plots
@@ -668,6 +671,43 @@ scoreboard stacked to `results/decide_sweep_<scenario>.csv`.
 
 To keep a sweep to minutes, only two SplitEE rows are run: as published, and
 with every repair at once.
+
+### Run it for real
+
+```bash
+uv run edge serve          # one terminal: the server
+uv run edge run --watch    # another: the device
+```
+
+Everything above looks outcomes up. This carries a rule's plans out: the
+device process runs the stage graphs a plan names, checks each exit's
+confidence, and when the plan says so sends the photo or the feature map over
+a TCP connection to the server process, which finishes the network and
+answers. The same frames are then looked up in the simulator, and the two are
+printed side by side: scores, how often they chose the same plan and gave the
+same answer, and how far apart their times were.
+
+Two things are emulated, and the output says so. A slower device (`--slowdown`)
+waits after each stage for the extra time it would have taken. And because
+loopback delivers in a fraction of a millisecond, the device waits before each
+send for the round trip and transfer time of the network that frame is on.
+Against a server on another machine, `--real-link` takes the link as it is.
+
+Run on mains power: the device and server profiles were taken on mains, and a
+battery run is visibly slower. The run is written to
+`results/live_<checkpoint>_<scenario>_<rule>.csv.gz`.
+
+> [!NOTE]
+> A live server is slower than its profile. Profiled back to back, the laptop
+> answered a photo in 6.27 ms; live, waiting between requests, it took 9.58 ms,
+> because a processor that has just been idle starts slowly. The simulator is
+> optimistic by that much.
+
+To record how a real link behaves, for comparison with the assumed networks:
+
+```bash
+python scripts/record_network.py --label my_link --out results/network_trace_my_link.csv
+```
 
 ---
 
