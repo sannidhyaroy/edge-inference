@@ -698,10 +698,11 @@ battery run is visibly slower. The run is written to
 `results/live_<checkpoint>_<scenario>_<rule>.csv.gz`.
 
 > [!NOTE]
-> A live server is slower than its profile. Profiled back to back, the laptop
-> answered a photo in 6.27 ms; live, waiting between requests, it took 9.58 ms,
-> because a processor that has just been idle starts slowly. The simulator is
-> optimistic by that much.
+> A server that has been idle answers more slowly than its profile. Profiled
+> back to back, the laptop answered a photo in 6.27 ms. Live it took 6.41 ms
+> when the previous request was about 12 ms earlier, and 10.17 ms after a
+> 56 ms wait. The simulator replays the profile, so it is optimistic for
+> requests that arrive after a pause.
 
 To record how a real link behaves, for comparison with the assumed networks:
 
@@ -1015,6 +1016,35 @@ before sending pays, by median:
 The networks are illustrative assumptions, and the T4 was served through
 eager PyTorch, which a production server would beat. Both caveats, and the
 server measurements behind this, are in
+[`results/RESULTS.md`](results/RESULTS.md).
+
+### Deciding frame by frame
+
+A device 8 times slower than the laptop, a 30 ms deadline, and a network that
+alternates between a good state (5 ms, 100 Mbps) and a degraded one (50 ms,
+10 Mbps). Share of frames answered correctly in time:
+
+| rule                                                    | useful |
+| ------------------------------------------------------- | -----: |
+| always local, INT8                                      |  0.00% |
+| always send the photo                                   | 45.43% |
+| best fixed option: stop at the first INT8 exit          | 56.68% |
+| SplitEE as published                                    |  0.00% |
+| SplitEE with every repair                               | 56.69% |
+| this project's lookup rule, told the network            | 73.75% |
+| the same, learning the network from its own sends       | 66.87% |
+| best possible per frame, which needs the answer         | 77.74% |
+
+**Deciding pays in a narrow band.** Across four device speeds and four
+deadlines, switching with the network beat the best fixed option by 6 to 20
+points in 3 cells of 16, and was within a point of it in the other 13.
+
+Carried out between a device process and a server process on one laptop, the
+lookup rule scored 72.32% against 73.50% looked up.
+
+The slow device is the laptop's times multiplied by a constant, and both
+network states are assumed. Two real Wi-Fi links recorded for comparison both
+behaved like the degraded one. These limits and the rest are in
 [`results/RESULTS.md`](results/RESULTS.md).
 
 ---
