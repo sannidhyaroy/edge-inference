@@ -492,10 +492,10 @@ is never shown a label.
 | 3. best confidence rule per network | the network and each exit's confidence |
 | 4. best possible per frame          | which options answer correctly         |
 
-The third is the **fair target**: no rule that decides from the network and
-confidence can beat it. The fourth needs the answer in advance, so nothing can
-reach it. All four are found afterwards on the test frames themselves, which
-makes them optimistic by construction.
+The third is the **fair target**: the best that playing one plan per network
+state can do, over every plan of the family in section 15. The fourth needs
+the answer in advance, so nothing can reach it. All four are found afterwards
+on the test frames themselves, which makes them optimistic by construction.
 
 The default scenario: a device 8 times slower, a 30 ms deadline, the T4 server.
 
@@ -763,15 +763,19 @@ rules that do not learn, every one of 1962 frames was answered right or wrong
 exactly as looked up. That they played the same plan is true by construction,
 since each was told the same network sequence in both runs.
 
-**The simulator's medians hold and its tails are too thin.** For the lookup
-rule, 45 frames were in time looked up and late carried out, 25 of them with
-the right answer, and 2 went the other way: 23 useful frames, the 1.2 points
-between the two scores. 44 of the 45 were frames answered locally at the first
-INT8 exit. Their median was 21.59 ms carried out against 21.74 looked up, but
-their 99th percentile was 40.27 against 24.61 ms. The simulator replays one
-recorded time per image and so has no bad moments of its own. Part of this
-tail belongs to the emulation, since waiting 7 times as long multiplies any
-hiccup by 8.
+**The simulator's tails are too thin.** For the lookup rule, 45 frames were in
+time looked up and late carried out, 25 of them with the right answer, and 2
+went the other way: 23 useful frames, the 1.2 points between the two scores. 44
+of the 45 were frames answered locally at the first INT8 exit. Their median was
+21.59 ms carried out against 21.74 looked up, but their 99th percentile was
+40.27 against 24.61 ms. The simulator replays one recorded time per image and
+so has no bad moments of its own. Part of this tail belongs to the emulation,
+since waiting 7 times as long multiplies any hiccup by 8.
+
+**Longer local runs come out slower than looked up.** Running INT8 to the end
+took a mean 44.79 ms carried out against 41.23 ms looked up, 8.6% more. The
+device stops and waits after each of three stages, and each stage then starts
+on a processor that has just been idle.
 
 **A server that has been idle is slower.** Profiled back to back, the server
 answered a photo in a median 6.27 ms. In the run that sends every frame it
