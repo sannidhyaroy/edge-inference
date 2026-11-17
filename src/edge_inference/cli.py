@@ -5,6 +5,7 @@ be imported by later experiments rather than shelled out to.
 """
 
 import argparse
+import dataclasses
 import os
 from pathlib import Path
 
@@ -14,10 +15,12 @@ import torch
 from rich.console import Console
 from rich.table import Table
 
+from edge_inference.bandit import Bandit, variants
 from edge_inference.bench import (
     benchmark_model,
     benchmark_session,
     cpu_state,
+    power_source,
     resolve_device,
     set_thread_count,
     wait_for_cooldown,
@@ -60,6 +63,7 @@ from edge_inference.offload import (
     load_components,
     summarise,
 )
+from edge_inference.policies import OFFLOAD, Always, Lookup
 from edge_inference.profiling import operations_per_exit, profile_model
 from edge_inference.quantization import (
     DataLoaderCalibrationReader,
@@ -67,11 +71,10 @@ from edge_inference.quantization import (
     quantize_exit_stages,
     quantize_onnx,
 )
+from edge_inference.runtime import Device, LiveRun, Responder, compare, connect, serve
 from edge_inference.scoreboard import FAIR_TARGET, OURS, Setup, grid, run_setup, run_sweep
 from edge_inference.server import OnnxServer, TorchServer, profile_server
-from edge_inference.simulate import (
-    Measurements,
-)
+from edge_inference.simulate import Measurements, Plan, Scenario, simulate, split_images
 from edge_inference.split import profile_splits
 from edge_inference.training import fine_tune
 
@@ -1156,6 +1159,185 @@ def cmd_decide_sweep(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_serve(args: argparse.Namespace) -> int:
+    """Answer a device's requests with the float32 network, until interrupted."""
+    base = Path(args.checkpoint).with_suffix("")
+    paths = stage_paths(base)
+    missing = [path for path in paths if not path.exists()]
+    if missing:
+        console.print(f"[bold red]Missing stage graph:[/bold red] {missing[0]}")
+        return 1
+    responder = Responder(build_stage_sessions(paths, threads=args.threads))
+
+    def ready(port: int) -> None:
+        console.print(
+            f"Serving [bold]{base.name}[/bold] on {args.host}:{port} at {args.threads} threads. "
+            "Ctrl-C stops."
+        )
+
+    try:
+        serve(responder, args.host, args.port, on_ready=ready)
+    except KeyboardInterrupt:
+        console.print("Stopped.")
+    return 0
+
+
+LIVE_RULES = ("lookup", "splitee", "offload", "local-int8", "local-float32")
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    """Carry a rule out frame by frame against a server, next to the same run looked up."""
+    stem = Path(args.checkpoint).stem
+    base = Path(args.checkpoint).with_suffix("")
+    results = Path(args.results)
+    try:
+        components = load_components(results, stem, threads=args.threads, servers=SERVERS)
+    except FileNotFoundError as error:
+        console.print(f"[bold red]Missing profile:[/bold red] {error.filename}")
+        return 1
+
+    setup = Setup(
+        server=args.server_profile,
+        slowdown=args.slowdown,
+        deadline_ms=args.deadline,
+        good=args.good,
+        bad=args.bad,
+        stay_good=args.stay,
+        stay_bad=args.stay,
+        knowledge=args.knowledge,
+        passes=1,
+        seed=args.seed,
+    )
+    table = Measurements.from_components(components, setup.server)
+    held = split_images(table.labels, setup.tune_share, setup.seed)
+    tuning, test = table.subset(held), table.subset(~held)
+    whole = setup.scenario(test, setup.seed)
+    count = min(args.frames, len(whole.frames))
+    scenario = Scenario(
+        test,
+        whole.frames[:count],
+        whole.states[:count],
+        whole.networks,
+        whole.state_names,
+        slowdown=setup.slowdown,
+        deadline_ms=setup.deadline_ms,
+    )
+
+    def make_rule():
+        """A fresh copy of the chosen rule, since a learning rule keeps state."""
+        if args.rule == "lookup":
+            return Lookup(OURS, tuning, setup.slowdown)
+        if args.rule == "splitee":
+            repaired = variants(setup.scenario(tuning, setup.seed + 1), scenario, every=False)[-1]
+            return Bandit(repaired.name, repaired.settings)
+        plans = {"offload": OFFLOAD, "local-int8": Plan("int8"), "local-float32": Plan("float32")}
+        return Always(args.rule, plans[args.rule])
+
+    try:
+        connection = connect(args.host, args.port)
+    except OSError as error:
+        console.print(
+            f"[bold red]No server at {args.host}:{args.port}[/bold red] ({error}). "
+            "Start one with `edge serve` in another terminal."
+        )
+        return 1
+
+    dataset = load_split("val", root=Path(args.root))
+    files = image_files(dataset)
+    sessions = {
+        "float32": build_stage_sessions(stage_paths(base), threads=args.threads),
+        "int8": build_stage_sessions(stage_paths(base, suffix=".int8.onnx"), threads=args.threads),
+    }
+
+    def images(image: int) -> tuple[np.ndarray, int]:
+        tensor, label = dataset[image]
+        return tensor.unsqueeze(0).numpy(), int(label)
+
+    def photos(image: int) -> bytes:
+        return files[image].read_bytes()
+
+    device = Device(sessions, connection, slowdown=setup.slowdown)
+
+    def show(frame: dict[str, object]) -> None:
+        verdict = "[green]right[/green]" if frame["correct"] else "[red]wrong[/red]"
+        timing = "in time" if frame["in_time"] else "[yellow]late[/yellow]"
+        console.print(
+            f"{frame['frame']:>5}  {frame['network']:<8} {frame['plan']:<42} "
+            f"{frame['total_ms']:7.2f} ms  {verdict}, {timing}"
+        )
+
+    live = LiveRun(
+        device,
+        scenario,
+        images,
+        photos,
+        shaped=not args.real_link,
+        on_frame=show if args.watch else None,
+    )
+
+    # Warm every path up before anything is timed: both precisions and a send.
+    first = int(test.images[scenario.frames[0]])
+    warm_slowdown, device.slowdown = device.slowdown, 1.0
+    for plan in (Plan("float32"), Plan("int8"), OFFLOAD):
+        for _ in range(3):
+            device.run(plan, images(first)[0], photos(first))
+    device.slowdown = warm_slowdown
+
+    before = {"power_source": power_source(), **cpu_state()}
+    looked_up = simulate(make_rule(), scenario, setup.knowledge)
+    carried_out = simulate(make_rule(), scenario, setup.knowledge, execute=live)
+    after = cpu_state()
+    connection.close()
+
+    log = pd.DataFrame(live.log)
+    carried_out = carried_out.merge(log, on="frame")
+    sends = carried_out[carried_out["sent_bytes"] > 0]
+    link = "the link as it is" if args.real_link else "an emulated link"
+    console.print(
+        f"{count} frames; rule {args.rule}; device {setup.slowdown:g}x slower (emulated by "
+        f"waiting); deadline {setup.deadline_ms:g} ms; {link}; power {before['power_source']}; "
+        f"clock {before['cpu_mhz_max']:.0f} to {after['cpu_mhz_max']:.0f} MHz"
+    )
+    both = compare(looked_up, carried_out, setup.deadline_ms)
+    shown = Table(title="The same frames, looked up and carried out")
+    for column in ("run", "useful", "accuracy", "in time", "mean ms", "p95 ms", "sent"):
+        shown.add_column(column, justify="left" if column == "run" else "right")
+    for _, row in both.iterrows():
+        shown.add_row(
+            row["run"],
+            f"{row['useful'] * 100:.2f}",
+            f"{row['accuracy'] * 100:.2f}",
+            f"{row['on_time'] * 100:.2f}",
+            f"{row['mean_ms']:.2f}",
+            f"{row['p95_ms']:.2f}",
+            f"{row['sent_share'] * 100:.0f}%",
+        )
+    console.print(shown)
+    agreed = both.iloc[0]
+    console.print(
+        f"  Same plan on {agreed['same_plan'] * 100:.1f}% of frames, same right-or-wrong on "
+        f"{agreed['same_answer'] * 100:.1f}%. Carried out took {agreed['median_gap_ms']:+.2f} ms "
+        f"against looked up at the median; 95% of frames were within "
+        f"{agreed['p95_abs_gap_ms']:.2f} ms."
+    )
+    if len(sends):
+        named = (sends["network_guessed"] == sends["network"]).mean()
+        console.print(
+            f"  {len(sends)} frames were sent. From the time each took alone, the network was "
+            f"named correctly for {named * 100:.1f}%. Server time {sends['server_ms'].median():.2f} "
+            "ms at the median."
+        )
+
+    out = results / f"live_{stem}_{setup.tag()}_{args.rule}.csv.gz"
+    pd.concat(
+        [looked_up.assign(run="simulated"), carried_out.assign(run="live")], ignore_index=True
+    ).assign(**dataclasses.asdict(setup), rule=args.rule, real_link=args.real_link).to_csv(
+        out, index=False
+    )
+    console.print(f"Wrote [bold]{out}[/bold]")
+    return 0
+
+
 def cmd_exits_sweep(args: argparse.Namespace) -> int:
     """Exit vectors and a confidence-threshold sweep from a recorded profile."""
     profile = Path(args.profile)
@@ -1695,6 +1877,55 @@ def build_parser() -> argparse.ArgumentParser:
         help="setups scored at once (default: half the logical cores)",
     )
     decide_sweep.set_defaults(func=cmd_decide_sweep)
+
+    serve_parser = subparsers.add_parser(
+        "serve", help="answer a device's requests with the float32 network"
+    )
+    serve_parser.add_argument(
+        "--checkpoint",
+        default=str(CHECKPOINT_DIR / "resnet18_early_exit_imagenette.pt"),
+        help="names the stage graphs to serve; the file itself is not read",
+    )
+    serve_parser.add_argument(
+        "--host", default="127.0.0.1", help="0.0.0.0 to accept other machines"
+    )
+    serve_parser.add_argument("--port", type=int, default=8765)
+    serve_parser.add_argument("--threads", type=int, default=6)
+    serve_parser.set_defaults(func=cmd_serve)
+
+    run = subparsers.add_parser("run", help="carry a rule out frame by frame against `edge serve`")
+    run.add_argument(
+        "--checkpoint",
+        default=str(CHECKPOINT_DIR / "resnet18_early_exit_imagenette.pt"),
+        help="names the stage graphs and profiles; the file itself is not read",
+    )
+    run.add_argument("--rule", default="lookup", choices=LIVE_RULES)
+    run.add_argument("--host", default="127.0.0.1")
+    run.add_argument("--port", type=int, default=8765)
+    run.add_argument("--threads", type=int, default=2, help="the device's thread count")
+    run.add_argument("--frames", type=int, default=300)
+    run.add_argument("--slowdown", type=float, default=8.0)
+    run.add_argument("--deadline", type=float, default=30.0, help="deadline in ms")
+    run.add_argument("--good", default="wifi", choices=sorted(NETWORKS))
+    run.add_argument("--bad", default="4g", choices=sorted(NETWORKS))
+    run.add_argument("--stay", type=float, default=0.95)
+    run.add_argument("--knowledge", default="exact", help="exact, probe:N or sends")
+    run.add_argument(
+        "--server-profile",
+        default="cpu_t6",
+        choices=sorted(SERVERS),
+        help="the profiled server the looked-up run uses; pick the one most like the live server",
+    )
+    run.add_argument(
+        "--real-link",
+        action="store_true",
+        help="add no network delay: the link to the server is the real one",
+    )
+    run.add_argument("--watch", action="store_true", help="print each frame as it is decided")
+    run.add_argument("--root", default=str(DATA_DIR))
+    run.add_argument("--results", default=str(RESULTS_DIR), help="profile directory")
+    run.add_argument("--seed", type=int, default=SEED)
+    run.set_defaults(func=cmd_run)
 
     bench = subparsers.add_parser("bench", help="measure forward pass latency")
     bench.add_argument("--backbone", default="resnet18", choices=SUPPORTED_BACKBONES)
