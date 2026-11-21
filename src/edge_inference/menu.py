@@ -7,6 +7,7 @@ INT8. Every later table joins on the manifest's `image` index, never on the
 order files happen to be listed in.
 """
 
+import contextlib
 import hashlib
 from pathlib import Path
 
@@ -137,3 +138,78 @@ def answer_variant(job: tuple) -> pd.DataFrame:
     recipe = Path(directory) / f"{name}@{resolution}.json"
     found = answers(sessions, recipe, table, Path(root), threads=threads)
     return found.assign(model=name, resolution=resolution)
+
+
+def cpu_settings(cpus: list[int]) -> dict[str, object]:
+    """How the device's cores are set: which, their governor, limits and average clock.
+
+    Read for every pinned core, since a slowed device pins some cores and the
+    others keep the system's settings.
+    """
+    base = Path("/sys/devices/system/cpu")
+
+    def read(cpu: int, name: str) -> str:
+        try:
+            return (base / f"cpu{cpu}" / "cpufreq" / name).read_text().strip()
+        except OSError:
+            return ""
+
+    boost = ""
+    with contextlib.suppress(OSError):
+        boost = (base / "cpufreq" / "boost").read_text().strip()
+    return {
+        "cpus": ",".join(map(str, cpus)),
+        "boost": boost,
+        "governor": ",".join(read(c, "scaling_governor") for c in cpus),
+        "min_mhz": ",".join(str(int(read(c, "scaling_min_freq") or 0) // 1000) for c in cpus),
+        "max_mhz": ",".join(str(int(read(c, "scaling_max_freq") or 0) // 1000) for c in cpus),
+    }
+
+
+def average_mhz(cpus: list[int]) -> float:
+    """The pinned cores' current clock, averaged; NaN where it cannot be read."""
+    values = []
+    for cpu in cpus:
+        try:
+            path = Path(f"/sys/devices/system/cpu/cpu{cpu}/cpufreq/scaling_cur_freq")
+            values.append(int(path.read_text()) / 1000)
+        except OSError, ValueError:
+            continue
+    return float(np.mean(values)) if values else float("nan")
+
+
+def profile_variant(
+    session,
+    recipe,
+    frames: list,
+    *,
+    warmup: int,
+    clock,
+    cpus: list[int],
+) -> pd.DataFrame:
+    """Time one graph on each frame: preparing the input, then running it.
+
+    `frames` are (image index, decoded frame) pairs; decoding is the camera's
+    work and is not timed.
+    """
+    from edge_inference.ort_session import INPUT_NAME, OUTPUT_NAME
+
+    first = recipe(frames[0][1])
+    for _ in range(warmup):
+        session.run([OUTPUT_NAME], {INPUT_NAME: first})
+    rows = []
+    for image, frame in frames:
+        start = clock()
+        x = recipe(frame)
+        prepared = clock()
+        session.run([OUTPUT_NAME], {INPUT_NAME: x})
+        done = clock()
+        rows.append(
+            {
+                "image": image,
+                "preprocess_ms": (prepared - start) * 1000.0,
+                "device_ms": (done - prepared) * 1000.0,
+                "cpu_mhz": average_mhz(cpus),
+            }
+        )
+    return pd.DataFrame(rows)

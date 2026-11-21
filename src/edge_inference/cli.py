@@ -19,7 +19,9 @@ from edge_inference.bandit import Bandit, variants
 from edge_inference.bench import (
     benchmark_model,
     benchmark_session,
+    cpu_model,
     cpu_state,
+    machine_model,
     power_source,
     resolve_device,
     set_thread_count,
@@ -324,6 +326,326 @@ def cmd_menu_answers(args: argparse.Namespace) -> int:
         .round(2)
     )
     console.print(summary.to_string())
+    return 0
+
+
+def parse_variant(key: str, directory: Path) -> tuple[Path, Path]:
+    """The graph and recipe for a variant written as model@resolution/precision."""
+    from edge_inference.zoo import recipe_path, variant_path
+
+    model, _, rest = key.partition("@")
+    resolution, _, precision = rest.partition("/")
+    resolution = int(resolution)
+    return (
+        variant_path(directory, model, resolution, precision or "float32"),
+        recipe_path(directory, model, resolution),
+    )
+
+
+def parse_photo(key: str) -> tuple[int, int]:
+    """A photo variant written as jpeg<shorter side>q<quality>, e.g. jpeg256q85."""
+    shorter, _, quality = key.removeprefix("jpeg").partition("q")
+    return int(shorter), int(quality)
+
+
+def cmd_menu_serve(args: argparse.Namespace) -> int:
+    """Answer photos with the menu's server models until interrupted."""
+    from edge_inference.serving import MenuServer, open_model
+    from edge_inference.wire import serve as serve_requests
+
+    directory = Path(args.dir)
+    models = {
+        key: open_model(*parse_variant(key, directory), threads=args.threads) for key in args.models
+    }
+    server = MenuServer(models, args.models[0])
+    console.print(
+        f"Serving {', '.join(args.models)} on {args.host}:{args.port} at {args.threads} threads"
+    )
+    try:
+        serve_requests(server.handle, args.host, args.port)
+    except KeyboardInterrupt:
+        console.print("Stopped")
+    return 0
+
+
+def cmd_probe(args: argparse.Namespace) -> int:
+    """Record a link to a server over the project's own protocol."""
+    from edge_inference.probe import probe
+    from edge_inference.wire import Connection
+
+    host, _, port = args.server.rpartition(":")
+    connection = Connection.open(host, int(port))
+    console.print(f"Probing {args.server} as [bold]{args.link}[/bold] for {args.seconds:g} s")
+    rows = probe(connection, link=args.link, seconds=args.seconds, tick_ms=args.tick_ms)
+    connection.close()
+    rows["label"] = args.label
+    out = Path(args.out or RESULTS_DIR / f"link_{args.link}_{args.label}.csv")
+    rows.to_csv(out, index=False)
+    summary = rows[["rtt_ms", "uplink_mbps", "photo_ms"]].describe(percentiles=[0.5, 0.95])
+    console.print(summary.loc[["count", "50%", "95%"]].round(2).to_string())
+    console.print(f"Wrote [bold]{out}[/bold] ({int(rows['error'].notna().sum())} errors)")
+    return 0
+
+
+def cmd_menu_payloads(args: argparse.Namespace) -> int:
+    """Encode each image as every photo variant, once, with a hash a server can check."""
+    import hashlib
+
+    from edge_inference.preprocess import encode_photo, load_frame
+
+    table = pd.read_csv(args.manifest)
+    if args.split:
+        table = table[table["split"] == args.split]
+    root, out = Path(args.root), Path(args.out)
+    for key in args.photos:
+        shorter, quality = parse_photo(key)
+        folder = out / key
+        folder.mkdir(parents=True, exist_ok=True)
+        rows = []
+        for row in table.itertuples():
+            data = encode_photo(load_frame(root / row.file), shorter, quality)
+            (folder / f"{row.image}.jpg").write_bytes(data)
+            rows.append(
+                {
+                    "image": row.image,
+                    "label": row.label,
+                    "split": row.split,
+                    "bytes": len(data),
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                }
+            )
+        index = pd.DataFrame(rows)
+        index.to_csv(out / f"{key}.csv", index=False)
+        console.print(
+            f"{key}: {len(index)} photos, median {index['bytes'].median() / 1000:.1f} kB, "
+            f"in [bold]{folder}[/bold]"
+        )
+    return 0
+
+
+def cmd_menu_profile_server(args: argparse.Namespace) -> int:
+    """Time a server model on every photo of a payload set: decode and prepare, then run."""
+    import hashlib
+    import time
+
+    from edge_inference.preprocess import decode_photo
+    from edge_inference.serving import answer, open_model
+
+    payloads = Path(args.payloads)
+    index = pd.read_csv(payloads.parent / f"{payloads.name}.csv")
+    directory, results = Path(args.dir), Path(args.results)
+    for key in args.models:
+        served = open_model(*parse_variant(key, directory), threads=args.threads)
+        cool_down(args.cool_to)
+        warm = (payloads / f"{index['image'].iloc[0]}.jpg").read_bytes()
+        for _ in range(args.warmup):
+            served.session.run(None, {"input": served.recipe(decode_photo(warm))})
+        rows = []
+        for row in index.itertuples():
+            data = (payloads / f"{row.image}.jpg").read_bytes()
+            if hashlib.sha256(data).hexdigest() != row.sha256:
+                raise ValueError(f"photo {row.image} differs from its manifest")
+            start = time.perf_counter()
+            x = served.recipe(decode_photo(data))
+            prepared = time.perf_counter()
+            logits = served.session.run(None, {"input": x})[0][0]
+            done = time.perf_counter()
+            predicted, confidence = answer(logits)
+            rows.append(
+                {
+                    "image": row.image,
+                    "label": row.label,
+                    "split": row.split,
+                    "bytes": row.bytes,
+                    "receive_ms": (prepared - start) * 1000.0,
+                    "compute_ms": (done - prepared) * 1000.0,
+                    "predicted": predicted,
+                    "confidence": confidence,
+                    "correct": predicted == row.label,
+                    **cpu_state(),
+                }
+            )
+        frame = pd.DataFrame(rows).assign(
+            server=args.server, model=key, photo=payloads.name, threads=args.threads,
+            machine=machine_model(), cpu=cpu_model(), power_source=power_source(),
+        )  # fmt: skip
+        safe = key.replace("/", "_")
+        out = results / f"menu_server_{args.server}_{safe}_{payloads.name}.csv.gz"
+        frame.to_csv(out, index=False)
+        console.print(
+            f"{key} on {args.server}: accuracy {frame['correct'].mean() * 100:.2f}%, "
+            f"receive {frame['receive_ms'].median():.2f} ms, compute "
+            f"{frame['compute_ms'].median():.2f} ms (medians); wrote [bold]{out}[/bold]"
+        )
+    return 0
+
+
+DEVICE_MODELS = ("resnet18", "mnv3l", "mnv4s", "mnv4m")
+
+
+def device_variants(directory: Path) -> list[str]:
+    """Every exported device variant, as model@resolution/precision, in a stable order."""
+    keys = []
+    for path in sorted(directory.glob("*@*.json")):
+        model, _, resolution = path.stem.partition("@")
+        if model not in DEVICE_MODELS:
+            continue
+        for precision in ("float32", "int8"):
+            graph = path.with_suffix(".int8.onnx" if precision == "int8" else ".onnx")
+            if graph.exists():
+                keys.append(f"{model}@{resolution}/{precision}")
+    return keys
+
+
+def cmd_menu_profile_device(args: argparse.Namespace) -> int:
+    """Time every device variant per image, the photo encodings, and optionally energy."""
+    import time
+
+    from edge_inference.energy import counters, measure, summarise
+    from edge_inference.menu import cpu_settings, profile_variant
+    from edge_inference.preprocess import encode_photo, load_frame
+    from edge_inference.serving import open_model
+
+    directory, root, results = Path(args.dir), Path(args.root), Path(args.results)
+    cpus = [int(c) for c in args.cpus.split(",")] if args.cpus else sorted(os.sched_getaffinity(0))
+    if args.cpus:
+        os.sched_setaffinity(0, cpus)
+    table = pd.read_csv(args.manifest)
+    chosen = table[table["split"] == "test"].sample(n=args.images, random_state=SEED)
+    chosen = chosen.sort_values("image")
+    frames = [(row.image, load_frame(root / row.file)) for row in chosen.itertuples()]
+    keys = args.variants or device_variants(directory)
+    settings = cpu_settings(cpus)
+    labels = {"config": args.config, "threads": args.threads, **settings,
+              "machine": machine_model(), "cpu": cpu_model(), "power_source": power_source()}  # fmt: skip
+    console.print(f"{args.config}: {len(keys)} variants on {len(frames)} images, cores {cpus}")
+
+    timed = []
+    for key in keys:
+        served = open_model(*parse_variant(key, directory), threads=args.threads)
+        cool_down(args.cool_to)
+        rows = profile_variant(
+            served.session, served.recipe, frames, warmup=args.warmup,
+            clock=time.perf_counter, cpus=cpus,
+        )  # fmt: skip
+        timed.append(rows.assign(variant=key))
+        console.print(
+            f"  {key}: device {rows['device_ms'].median():.2f} ms, "
+            f"preprocess {rows['preprocess_ms'].median():.2f} ms (medians)"
+        )
+    device = pd.concat(timed, ignore_index=True).assign(**labels)
+    device.to_csv(results / f"menu_device_{args.config}.csv.gz", index=False)
+
+    encoded = []
+    for photo in args.photos:
+        shorter, quality = parse_photo(photo)
+        for image, frame in frames:
+            start = time.perf_counter()
+            data = encode_photo(frame, shorter, quality)
+            encoded.append({"image": image, "photo": photo, "bytes": len(data),
+                            "prepare_ms": (time.perf_counter() - start) * 1000.0})  # fmt: skip
+    pd.DataFrame(encoded).assign(**labels).to_csv(
+        results / f"menu_encode_{args.config}.csv.gz", index=False
+    )
+
+    if args.energy:
+        found = counters()
+        if not found:
+            console.print("[yellow]RAPL counters are not readable: no energy measured.[/yellow]")
+        else:
+            rows = []
+            frame = frames[0][1]
+            for key in keys:
+                served = open_model(*parse_variant(key, directory), threads=args.threads)
+                run = lambda s=served: s.session.run(None, {"input": s.recipe(frame)})  # noqa: E731
+                cool_down(args.cool_to)
+                runs = [measure(run, args.energy_runs, found) for _ in range(args.energy_repeats)]
+                for domain in found:
+                    rows.append({"what": key, "domain": domain, **summarise(runs, domain),
+                                 "idle_w": float(np.mean([r[f"{domain}_idle_w"] for r in runs])),
+                                 "runs": args.energy_runs, "repeats": args.energy_repeats})  # fmt: skip
+                console.print(f"  {key}: {rows[-len(found)]['mean_j'] * 1000:.1f} mJ (package)")
+            for photo in args.photos:
+                shorter, quality = parse_photo(photo)
+                encode = lambda s=shorter, q=quality: encode_photo(frame, s, q)  # noqa: E731
+                runs = [
+                    measure(encode, args.energy_runs, found) for _ in range(args.energy_repeats)
+                ]
+                for domain in found:
+                    rows.append({"what": photo, "domain": domain, **summarise(runs, domain),
+                                 "idle_w": float(np.mean([r[f"{domain}_idle_w"] for r in runs])),
+                                 "runs": args.energy_runs, "repeats": args.energy_repeats})  # fmt: skip
+            pd.DataFrame(rows).assign(**labels).to_csv(
+                results / f"menu_energy_{args.config}.csv", index=False
+            )
+    console.print(f"Wrote the {args.config} profiles to [bold]{results}[/bold]")
+    return 0
+
+
+def cmd_menu_live(args: argparse.Namespace) -> int:
+    """Carry plans out frame by frame against a menu server, and log every frame."""
+    import time
+
+    from edge_inference.device import Device, PhotoRoute, Variant
+    from edge_inference.preprocess import load_frame
+    from edge_inference.serving import open_model
+    from edge_inference.simulate import Plan
+    from edge_inference.wire import Connection
+
+    table = pd.read_csv(args.manifest)
+    table = table[table["split"] == args.split].sample(
+        n=min(args.frames, len(table)), random_state=SEED
+    )
+    directory, root = Path(args.dir), Path(args.root)
+    variants = {}
+    if args.variant:
+        served = open_model(*parse_variant(args.variant, directory), threads=args.threads)
+        variants[args.variant] = Variant(served.session, served.recipe)
+    shorter, quality = parse_photo(args.photo)
+    routes = {"photo": PhotoRoute(shorter, quality, args.server_model)}
+    link = None
+    if args.emulate:
+        rtt, mbps = (float(v) for v in args.emulate.split(","))
+        link = lambda size: rtt + size * 8 / (mbps * 1000.0)  # noqa: E731
+    host, _, port = args.server.rpartition(":")
+    connection = Connection.open(host, int(port), link=link)
+    device = Device(variants, routes, connection)
+    plans = {
+        "local": Plan(args.variant),
+        "offload": Plan(route="photo"),
+        "hedge": Plan(args.variant, route="photo", hedge=True),
+    }
+    rows = []
+    for name in args.plans:
+        plan = plans[name]
+        for row in table.itertuples():
+            frame = load_frame(root / row.file)
+            measured = device.run(
+                plan, frame, row.label,
+                deadline_ms=args.deadline, horizon_ms=args.horizon, cancel=args.cancel,
+            )  # fmt: skip
+            rows.append({"plan": name, "image": row.image, **dataclasses.asdict(measured)})
+            time.sleep(args.period_ms / 1000.0)
+    connection.close()
+    frames = pd.DataFrame(rows).assign(
+        variant=args.variant, photo=args.photo, server_model=args.server_model,
+        deadline_ms=args.deadline, horizon_ms=args.horizon, cancel=args.cancel,
+        emulated=args.emulate or "", link=args.link,
+    )  # fmt: skip
+    frames["useful"] = frames["correct"] & (frames["total_ms"] <= args.deadline)
+    arrived = frames["server_at_ms"] <= args.horizon
+    frames["record"] = frames["server_correct"].where(arrived, frames["local_correct"])
+    out = Path(args.out or RESULTS_DIR / f"menu_live_{args.link}_{args.label}.csv.gz")
+    frames.to_csv(out, index=False)
+    summary = frames.groupby("plan").agg(
+        useful=("useful", "mean"),
+        record=("record", "mean"),
+        busy_ms=("device_busy_ms", "mean"),
+        total_ms=("total_ms", "median"),
+        cancelled=("cancelled", "mean"),
+    )
+    console.print(summary.round(3).to_string())
+    console.print(f"Wrote [bold]{out}[/bold]")
     return 0
 
 
@@ -1721,6 +2043,97 @@ def build_parser() -> argparse.ArgumentParser:
     menu_answers.add_argument("--dir", default=str(MENU_DIR))
     menu_answers.add_argument("--results", default=str(RESULTS_DIR))
     menu_answers.set_defaults(func=cmd_menu_answers)
+
+    menu_serve = menu_sub.add_parser("serve", help="answer photos with the menu's server models")
+    menu_serve.add_argument(
+        "--models", type=lambda s: s.split(","), required=True,
+        help="variants as model@resolution/precision; the first is the default",
+    )  # fmt: skip
+    menu_serve.add_argument("--threads", type=int, default=6)
+    menu_serve.add_argument("--host", default="0.0.0.0")
+    menu_serve.add_argument("--port", type=int, default=8765)
+    menu_serve.add_argument("--dir", default=str(MENU_DIR))
+    menu_serve.set_defaults(func=cmd_menu_serve)
+
+    menu_payloads = menu_sub.add_parser("payloads", help="encode every photo variant once")
+    menu_payloads.add_argument("--photos", type=lambda s: s.split(","), default=["jpeg256q85"])
+    menu_payloads.add_argument("--split", default="")
+    menu_payloads.add_argument("--manifest", default=str(MENU_MANIFEST))
+    menu_payloads.add_argument("--root", default=str(IMAGENETV2_ROOT))
+    menu_payloads.add_argument("--out", default=str(DATA_DIR / "payloads"))
+    menu_payloads.set_defaults(func=cmd_menu_payloads)
+
+    menu_profile_server = menu_sub.add_parser(
+        "profile-server", help="time server models on a payload set"
+    )
+    menu_profile_server.add_argument("--payloads", required=True, help="a folder from payloads")
+    menu_profile_server.add_argument("--models", type=lambda s: s.split(","), required=True)
+    menu_profile_server.add_argument("--server", required=True, help="a name for this server")
+    menu_profile_server.add_argument("--threads", type=int, default=6)
+    menu_profile_server.add_argument("--warmup", type=int, default=20)
+    menu_profile_server.add_argument("--cool-to", type=float, default=None)
+    menu_profile_server.add_argument("--dir", default=str(MENU_DIR))
+    menu_profile_server.add_argument("--results", default=str(RESULTS_DIR))
+    menu_profile_server.set_defaults(func=cmd_menu_profile_server)
+
+    menu_profile_device = menu_sub.add_parser(
+        "profile-device", help="time every device variant per image, with encodings and energy"
+    )
+    menu_profile_device.add_argument("--config", required=True, help="a name for this device setup")
+    menu_profile_device.add_argument("--variants", type=lambda s: s.split(","), default=None)
+    menu_profile_device.add_argument("--images", type=int, default=1000)
+    menu_profile_device.add_argument("--threads", type=int, default=2)
+    menu_profile_device.add_argument("--cpus", default="", help="cores to pin to, e.g. 2,4")
+    menu_profile_device.add_argument("--warmup", type=int, default=20)
+    menu_profile_device.add_argument("--cool-to", type=float, default=None)
+    menu_profile_device.add_argument(
+        "--photos", type=lambda s: s.split(","), default=["jpeg256q85", "jpeg160q85"]
+    )
+    menu_profile_device.add_argument("--energy", action="store_true")
+    menu_profile_device.add_argument("--energy-runs", type=int, default=200)
+    menu_profile_device.add_argument("--energy-repeats", type=int, default=5)
+    menu_profile_device.add_argument("--manifest", default=str(MENU_MANIFEST))
+    menu_profile_device.add_argument("--root", default=str(IMAGENETV2_ROOT))
+    menu_profile_device.add_argument("--dir", default=str(MENU_DIR))
+    menu_profile_device.add_argument("--results", default=str(RESULTS_DIR))
+    menu_profile_device.set_defaults(func=cmd_menu_profile_device)
+
+    menu_live = menu_sub.add_parser("live", help="carry plans out against a menu server")
+    menu_live.add_argument("--server", required=True, help="host:port")
+    menu_live.add_argument("--variant", default="", help="the device's model@resolution/precision")
+    menu_live.add_argument("--photo", default="jpeg256q85")
+    menu_live.add_argument("--server-model", required=True)
+    menu_live.add_argument(
+        "--plans", type=lambda s: s.split(","), default=["local", "offload", "hedge"]
+    )
+    menu_live.add_argument("--cancel", default=NEVER, choices=[NEVER, AT_ONCE])
+    menu_live.add_argument("--deadline", type=float, default=100.0)
+    menu_live.add_argument("--horizon", type=float, default=HORIZON_MS)
+    menu_live.add_argument("--frames", type=int, default=200)
+    menu_live.add_argument("--split", default="test")
+    menu_live.add_argument("--period-ms", type=float, default=100.0)
+    menu_live.add_argument("--threads", type=int, default=2)
+    menu_live.add_argument(
+        "--emulate", default="", help="rtt_ms,uplink_mbps to emulate the link; empty for a real one"
+    )
+    menu_live.add_argument("--link", default="loopback", help="a name for the link")
+    menu_live.add_argument("--label", default="run")
+    menu_live.add_argument("--out", default="")
+    menu_live.add_argument("--manifest", default=str(MENU_MANIFEST))
+    menu_live.add_argument("--root", default=str(IMAGENETV2_ROOT))
+    menu_live.add_argument("--dir", default=str(MENU_DIR))
+    menu_live.set_defaults(func=cmd_menu_live)
+
+    probe_parser = subparsers.add_parser(
+        "probe", help="record a link to a server over the project's protocol"
+    )
+    probe_parser.add_argument("--server", required=True, help="host:port")
+    probe_parser.add_argument("--link", required=True, help="a name for the link")
+    probe_parser.add_argument("--label", default="session")
+    probe_parser.add_argument("--seconds", type=float, default=600.0)
+    probe_parser.add_argument("--tick-ms", type=float, default=100.0)
+    probe_parser.add_argument("--out", default="")
+    probe_parser.set_defaults(func=cmd_probe)
 
     train = subparsers.add_parser("train", help="fine-tune a backbone on Imagenette")
     train.add_argument("--backbone", default="resnet18", choices=SUPPORTED_BACKBONES)
