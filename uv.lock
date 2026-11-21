@@ -283,6 +283,7 @@ dependencies = [
     { name = "onnxruntime" },
     { name = "onnxscript" },
     { name = "pandas" },
+    { name = "pillow" },
     { name = "rich" },
 ]
 
@@ -320,6 +321,7 @@ requires-dist = [
     { name = "onnxruntime", specifier = ">=1.29.0" },
     { name = "onnxscript", specifier = ">=0.7.1" },
     { name = "pandas", specifier = ">=3.0.5" },
+    { name = "pillow", specifier = ">=12.3.0" },
     { name = "rich", specifier = ">=15.0.0" },
     { name = "timm", marker = "extra == 'cpu'", specifier = ">=1.0" },
     { name = "timm", marker = "extra == 'cuda'", specifier = ">=1.0" },
