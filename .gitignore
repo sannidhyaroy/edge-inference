@@ -439,7 +439,8 @@ http-client.private.env.json
 # Datasets and trained weights
 #   Large, and fully reproducible from code + uv.lock, so they stay out of git.
 #   Note that results/ is deliberately NOT ignored: the CSVs, JSON and plots in
-#   there are the deliverable we show the professor.
+#   there are what the project produces, and every number in its write-ups
+#   comes from them.
 data/
 checkpoints/
 *.pt
