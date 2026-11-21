@@ -32,11 +32,10 @@ from torch.utils.data import Dataset
 
 from edge_inference.bench import cpu_model, cpu_policy, cpu_state, machine_model, power_source
 from edge_inference.config import SEED
+from edge_inference.constants import EXIT_NAMES, SPLIT_NAMES  # noqa: F401
 from edge_inference.export import FEATURES_NAME, OUTPUT_NAME, run_stage
-from edge_inference.models import EXIT_NAMES
 
 # Every exit but the last is a place the network can be cut.
-SPLIT_NAMES = EXIT_NAMES[:-1]
 
 # Bytes sent with an 8-bit payload besides the values: a float32 scale and a
 # one-byte zero point, so the server can map the levels back to floats.

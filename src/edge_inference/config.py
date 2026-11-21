@@ -9,8 +9,6 @@ one place.
 import random
 from pathlib import Path
 
-import torch
-
 # One fixed seed for the whole project. Any script that draws random numbers
 # calls seed_everything() before doing so.
 SEED = 42
@@ -63,5 +61,7 @@ def seed_everything(seed: int = SEED) -> None:
     considerably slower and makes others raise outright, which is a poor trade
     for a project whose headline numbers are latency measurements.
     """
+    import torch  # here, so that importing the constants never needs torch
+
     random.seed(seed)
     torch.manual_seed(seed)

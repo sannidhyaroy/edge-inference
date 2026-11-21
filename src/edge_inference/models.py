@@ -10,6 +10,8 @@ import torch
 from torch import nn
 from torchvision import models
 
+from edge_inference.constants import EXIT_NAMES  # noqa: F401  (re-exported)
+
 SUPPORTED_BACKBONES = ("resnet18",)
 
 
@@ -43,11 +45,6 @@ def build_backbone(
         model.fc = nn.Linear(model.fc.in_features, num_classes)
 
     return model
-
-
-# Where each exit sits, named after the ResNet block it follows. Used to label
-# results, so a row says which exit it describes rather than an index.
-EXIT_NAMES = ("layer2", "layer3", "layer4")
 
 
 def _out_channels(stage: nn.Module) -> int:

@@ -28,7 +28,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from edge_inference.models import EXIT_NAMES
+from edge_inference.constants import EXIT_NAMES
 
 # Component columns, in the order a frame pays them.
 COMPONENTS = ("device_ms", "prepare_ms", "server_receive_ms", "server_compute_ms")

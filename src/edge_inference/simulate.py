@@ -35,9 +35,8 @@ from typing import Protocol
 import numpy as np
 import pandas as pd
 
-from edge_inference.models import EXIT_NAMES
+from edge_inference.constants import EXIT_NAMES, SPLIT_NAMES
 from edge_inference.offload import Network
-from edge_inference.split import SPLIT_NAMES
 
 # The early-exit table: two precisions of one network with three exits, and
 # feature maps at the first two. Other tables bring their own variants and routes.
