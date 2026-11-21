@@ -32,7 +32,10 @@ from edge_inference.decide import TIE_MARGIN
 from edge_inference.offload import NETWORKS
 from edge_inference.policies import Always, Lookup, plan_family, simple_rules
 from edge_inference.simulate import (
+    AT_EXIT,
+    AT_ONCE,
     HORIZON_MS,
+    NEVER,
     Measurements,
     Plan,
     Rule,
@@ -73,7 +76,7 @@ class Setup:
     tune_share: float = 0.5
     seed: int = SEED
     hedge: bool = False
-    cancel: bool = False
+    cancel: str = NEVER
     horizon_ms: float = HORIZON_MS
     price_busy: float = 0.0
     price_kb: float = 0.0
@@ -100,7 +103,7 @@ class Setup:
         """The part of the tag for hedging, the horizon and prices; empty by default."""
         tag = ""
         if self.hedge:
-            tag += "_hedge" + ("-cancel" if self.cancel else "")
+            tag += "_hedge" + {NEVER: "", AT_EXIT: "-cancel", AT_ONCE: "-cancel-now"}[self.cancel]
         if self.horizon_ms != HORIZON_MS:
             tag += f"_H{self.horizon_ms:g}"
         if self.price_busy or self.price_kb:

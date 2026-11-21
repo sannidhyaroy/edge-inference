@@ -53,6 +53,11 @@ ANSWER, FEATURES, PHOTO = "answer", "features", "photo"
 # still replaces the one shown.
 HORIZON_MS = 1000.0
 
+# When a hedged local run stops once the server has answered: not at all, at
+# the next exit it reaches, or at once. A runtime can abort a graph while it
+# runs, so stopping at once needs no exit to stop at.
+NEVER, AT_EXIT, AT_ONCE = "never", "exit", "now"
+
 
 @dataclass(frozen=True)
 class Local:
@@ -363,13 +368,14 @@ def resolve(
     slowdown: float = 1.0,
     *,
     deadline_ms: float | None = None,
-    cancel: bool = False,
+    cancel: str = NEVER,
 ) -> Outcome:
     """Carry out `plan` on the images at `rows`, each over its own network.
 
     A hedged plan needs `deadline_ms`: until then the device waits for the
-    server, and only then gives its own answer. With `cancel`, a hedged local
-    run stops at the next exit once the server's answer is in.
+    server, and only then gives its own answer. `cancel` says when a hedged
+    local run stops once the server's answer is in: `NEVER`, `AT_EXIT` (the
+    next exit it reaches) or `AT_ONCE`.
     """
     rows = np.asarray(rows)
     count = len(rows)
@@ -487,7 +493,7 @@ def _hedge(
     network: Network,
     slowdown: float,
     deadline_ms: float | None,
-    cancel: bool,
+    cancel: str,
     block: Local,
     stopped: np.ndarray,
     local_busy: np.ndarray,
@@ -523,8 +529,10 @@ def _hedge(
     )
     correct = np.where(by_server, server_right, local_right)
 
+    if cancel not in (NEVER, AT_EXIT, AT_ONCE):
+        raise ValueError(f"cancel must be {NEVER}, {AT_EXIT} or {AT_ONCE}, got {cancel!r}")
     busy = local_at
-    if cancel:
+    if cancel == AT_EXIT:
         # The device stops at the first exit it reaches after the answer is in.
         boundaries = prepare[:, None] + slowdown * block.ms[rows]
         reached = boundaries >= server_at[:, None]
@@ -532,6 +540,9 @@ def _hedge(
         first = np.minimum(first, stopped)
         cut = boundaries[np.arange(len(rows)), first]
         busy = np.where(server_at < local_at, cut, local_at)
+    elif cancel == AT_ONCE:
+        # The device stops the moment the answer is in.
+        busy = np.minimum(server_at, local_at)
 
     return Outcome(
         total_ms=total,
@@ -633,8 +644,8 @@ class Scenario:
     slowdown: float
     deadline_ms: float
     horizon_ms: float = HORIZON_MS
-    # Whether a hedged local run stops once the server's answer is in.
-    cancel: bool = False
+    # When a hedged local run stops once the server's answer is in.
+    cancel: str = NEVER
     rtt_ms: np.ndarray = field(init=False)
     uplink_mbps: np.ndarray = field(init=False)
 

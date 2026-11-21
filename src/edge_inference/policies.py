@@ -37,6 +37,7 @@ from edge_inference.offload import Network
 from edge_inference.simulate import (
     ANSWER,
     FEATURES,
+    NEVER,
     PHOTO,
     Feedback,
     Measurements,
@@ -145,7 +146,7 @@ def best_plan(
     deadline_ms: float,
     tie_margin: float = TIE_MARGIN,
     prices: tuple[float, float] = (0.0, 0.0),
-    cancel: bool = False,
+    cancel: str = NEVER,
 ) -> Plan:
     """The plan with the best useful share, net of `prices`, on the tuning images.
 
@@ -244,7 +245,7 @@ class Lookup:
     probe_every: int | None = None
     table: dict[tuple[float, float, float], Plan] = field(default_factory=dict)
     prices: tuple[float, float] = (0.0, 0.0)
-    cancel: bool = False
+    cancel: str = NEVER
 
     def __post_init__(self) -> None:
         if self.plans is None:

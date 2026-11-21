@@ -86,7 +86,10 @@ from edge_inference.scoreboard import (
 )
 from edge_inference.server import OnnxServer, TorchServer, profile_server
 from edge_inference.simulate import (
+    AT_EXIT,
+    AT_ONCE,
     HORIZON_MS,
+    NEVER,
     Measurements,
     Plan,
     Scenario,
@@ -1540,8 +1543,12 @@ def add_hedge_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--cancel",
-        action="store_true",
-        help="stop a hedged local run at the next exit once the server has answered",
+        nargs="?",
+        const=AT_EXIT,
+        default=NEVER,
+        choices=[AT_EXIT, AT_ONCE],
+        help="once the server has answered, stop a hedged local run at the next exit "
+        "(the default) or at once (now)",
     )
     parser.add_argument(
         "--horizon",

@@ -15,6 +15,9 @@ from edge_inference.offload import Network
 from edge_inference.policies import plan_family
 from edge_inference.scoreboard import HEDGE, OURS_HEDGED, Setup, run_setup
 from edge_inference.simulate import (
+    AT_EXIT,
+    AT_ONCE,
+    NEVER,
     Measurements,
     Plan,
     Scenario,
@@ -28,10 +31,10 @@ from test_yardsticks import random_table
 
 ROWS = np.arange(4)
 INSTANT = Network(rtt_ms=0, uplink_mbps=1e9)
-NEVER = Network(rtt_ms=1e6, uplink_mbps=1e-6)
+NEVER_LINK = Network(rtt_ms=1e6, uplink_mbps=1e-6)
 
 
-def run(plan, network=NETWORK, *, deadline_ms=20.0, slowdown=1.0, cancel=False):
+def run(plan, network=NETWORK, *, deadline_ms=20.0, slowdown=1.0, cancel=NEVER):
     return resolve(
         measurements(),
         plan,
@@ -49,8 +52,8 @@ def useful(outcome, deadline_ms=20.0):
 
 
 def test_a_hedge_over_a_link_that_never_delivers_answers_locally():
-    local = run(Plan("int8"), NEVER)
-    hedged = run(Plan("int8", hedge=True), NEVER)
+    local = run(Plan("int8"), NEVER_LINK)
+    hedged = run(Plan("int8", hedge=True), NEVER_LINK)
 
     assert useful(hedged).tolist() == useful(local).tolist()
     # The local answer is ready at 3 ms but given at the deadline.
@@ -86,14 +89,46 @@ def test_when_both_are_late_the_first_answer_is_given():
     assert (hedged.answered_at == -1).all()
 
 
-def test_cancelling_stops_the_local_run_at_the_next_exit_and_never_costs_more():
+def test_cancelling_stops_the_local_run_at_the_next_exit_or_at_once():
     # At 4x the exits come at 8, 16 and 24 ms; the answer is in at 15 ms.
     whole = run(Plan("float32", hedge=True), slowdown=4.0)
-    cut = run(Plan("float32", hedge=True), slowdown=4.0, cancel=True)
+    at_exit = run(Plan("float32", hedge=True), slowdown=4.0, cancel=AT_EXIT)
+    at_once = run(Plan("float32", hedge=True), slowdown=4.0, cancel=AT_ONCE)
 
     assert whole.device_busy_ms.tolist() == [24.0] * 4
-    assert cut.device_busy_ms.tolist() == [16.0] * 4
-    assert cut.correct.tolist() == whole.correct.tolist()
+    assert at_exit.device_busy_ms.tolist() == [16.0] * 4
+    assert at_once.device_busy_ms.tolist() == [15.0] * 4
+    assert at_exit.correct.tolist() == whole.correct.tolist() == at_once.correct.tolist()
+
+
+def test_a_single_stage_plan_only_saves_by_stopping_at_once():
+    # int8 to exit 1 at 8x takes 8 ms, and exit 1 is the plan's only exit. Over a
+    # 1 ms round trip at 8 Mbps the photo's answer is in at 1 + 1 + 4 = 6 ms,
+    # inside that stage: stopping at the next exit stops nowhere.
+    fast = Network(rtt_ms=1, uplink_mbps=8)
+    plan = Plan("int8", 0, hedge=True)
+    whole = run(plan, fast, slowdown=8.0)
+    at_exit = run(plan, fast, slowdown=8.0, cancel=AT_EXIT)
+    at_once = run(plan, fast, slowdown=8.0, cancel=AT_ONCE)
+
+    assert whole.local_ms.tolist() == [8.0] * 4
+    assert whole.server_at_ms.tolist() == [6.0] * 4
+    assert at_exit.device_busy_ms.tolist() == whole.device_busy_ms.tolist() == [8.0] * 4
+    assert at_once.device_busy_ms.tolist() == [6.0] * 4
+
+
+def test_cancelling_never_costs_device_time():
+    for network in (NETWORK, INSTANT, NEVER_LINK):
+        times = [
+            run(Plan("float32", hedge=True), network, slowdown=4.0, cancel=mode).device_busy_ms
+            for mode in (NEVER, AT_EXIT, AT_ONCE)
+        ]
+        assert (times[1] <= times[0]).all() and (times[2] <= times[1]).all()
+
+
+def test_an_unknown_cancellation_mode_is_refused():
+    with pytest.raises(ValueError):
+        run(Plan("int8", hedge=True), cancel="later")
 
 
 def test_a_hedge_needs_a_deadline():
