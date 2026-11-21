@@ -24,10 +24,12 @@ dependencies = [
 # ends up on the wrong build.
 [project.optional-dependencies]
 cpu = [
+    "timm>=1.0",
     "torch>=2.14.0",
     "torchvision>=0.29.0",
 ]
 cuda = [
+    "timm>=1.0",
     "torch>=2.14.0",
     "torchvision>=0.29.0",
 ]

@@ -20,6 +20,7 @@ DEVICE_SIDE = (
     "bandit",
     "scoreboard",
     "manifest",
+    "preprocess",
     "signals",
 )
 
