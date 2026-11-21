@@ -25,6 +25,7 @@ DEVICE_SIDE = (
     "wire",
     "serving",
     "probe",
+    "device",
     "signals",
 )
 
