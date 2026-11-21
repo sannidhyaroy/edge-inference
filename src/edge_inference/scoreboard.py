@@ -9,6 +9,12 @@ the scoreboard with one row per rule and per yardstick.
 `run_sweep` does that for many setups at once, one process per core, and
 stacks the scoreboards. One scenario shows what happened; a sweep over device
 speeds, deadlines and seeds shows where it holds.
+
+With `hedge` set, two rules and two yardsticks join the board. "hedge, no
+network knowledge" plays one hedged plan on every frame, chosen on the tuning
+run without regard to the network. "lookup with hedging" is the lookup rule
+over a family that includes hedged plans. Rung 3h is the best plan per
+network over that family, and rung 4r the best possible record per frame.
 """
 
 import time
@@ -22,10 +28,13 @@ import pandas as pd
 
 from edge_inference.bandit import offload_cost_in_layers, variants
 from edge_inference.config import SEED
+from edge_inference.decide import TIE_MARGIN
 from edge_inference.offload import NETWORKS
-from edge_inference.policies import Lookup, simple_rules
+from edge_inference.policies import Always, Lookup, plan_family, simple_rules
 from edge_inference.simulate import (
+    HORIZON_MS,
     Measurements,
+    Plan,
     Rule,
     Scenario,
     View,
@@ -39,6 +48,8 @@ from edge_inference.yardsticks import ladder_runs, score_run
 
 FAIR_TARGET = "3. best confidence rule per network"
 OURS = "lookup (ours)"
+HEDGE = "hedge, no network knowledge"
+OURS_HEDGED = "lookup with hedging"
 
 # How old a sighting of the network may get before a frame is sent to refresh
 # it, tried when sending is the only way the rule learns the network.
@@ -60,6 +71,15 @@ class Setup:
     passes: int = 5
     tune_share: float = 0.5
     seed: int = SEED
+    hedge: bool = False
+    cancel: bool = False
+    horizon_ms: float = HORIZON_MS
+    price_busy: float = 0.0
+    price_kb: float = 0.0
+
+    @property
+    def prices(self) -> tuple[float, float]:
+        return (self.price_busy, self.price_kb)
 
     @property
     def names(self) -> list[str]:
@@ -73,6 +93,12 @@ class Setup:
             tag += f"_stay{self.stay_good:g}-{self.stay_bad:g}"
         if self.knowledge != "exact":
             tag += f"_{self.knowledge.replace(':', '')}"
+        if self.hedge:
+            tag += "_hedge" + ("-cancel" if self.cancel else "")
+        if self.horizon_ms != HORIZON_MS:
+            tag += f"_H{self.horizon_ms:g}"
+        if self.price_busy or self.price_kb:
+            tag += f"_price{self.price_busy:g}-{self.price_kb:g}"
         return tag
 
     def scenario(self, images: Measurements, seed: int) -> Scenario:
@@ -89,6 +115,8 @@ class Setup:
             self.names,
             slowdown=self.slowdown,
             deadline_ms=self.deadline_ms,
+            horizon_ms=self.horizon_ms,
+            cancel=self.cancel,
         )
 
 
@@ -103,23 +131,56 @@ class Result:
     held_out: bool
 
 
-def tuned_lookup(tuning: Measurements, tuning_scenario: Scenario, setup: Setup) -> Lookup:
+def tuned_lookup(
+    tuning: Measurements,
+    tuning_scenario: Scenario,
+    setup: Setup,
+    *,
+    name: str = OURS,
+    hedge: bool = False,
+) -> Lookup:
     """Our rule, with its probing interval chosen where probing is needed.
 
     The plans themselves come from the tuning images. The interval matters
     only when the rule learns the network from its own sends; it is chosen by
-    running the rule on the tuning scenario.
+    running the rule on the tuning scenario. With `hedge` the rule chooses
+    from a family that includes hedged plans.
     """
-    rule = Lookup(OURS, tuning, setup.slowdown)
+    rule = Lookup(
+        name,
+        tuning,
+        setup.slowdown,
+        plans=plan_family(tuning, hedge=hedge),
+        prices=setup.prices,
+        cancel=setup.cancel,
+    )
     if setup.knowledge != "sends":
         return rule
     useful = []
     for interval in PROBE_INTERVALS:
         rule.probe_every = interval
         trace = simulate(rule, tuning_scenario, setup.knowledge)
-        useful.append(score_trace(trace, setup.deadline_ms)["useful"])
+        useful.append(score_trace(trace, setup.deadline_ms, setup.horizon_ms)["useful"])
     rule.probe_every = PROBE_INTERVALS[int(np.argmax(useful))]
     return rule
+
+
+def tuned_hedge(tuning_scenario: Scenario, tie_margin: float = TIE_MARGIN) -> Always:
+    """The hedged plan that does best over the whole tuning run, whatever the network.
+
+    It is chosen knowing nothing about which network each frame met: one plan,
+    played on every frame. Near-ties go to the faster plan.
+    """
+    hedged = [plan for plan in plan_family(tuning_scenario.measurements, hedge=True) if plan.hedge]
+    useful, mean_ms = [], []
+    for plan in hedged:
+        outcome = tuning_scenario.resolve(plan)
+        useful.append((outcome.correct & (outcome.total_ms <= tuning_scenario.deadline_ms)).mean())
+        mean_ms.append(outcome.total_ms.mean())
+    useful, mean_ms = np.array(useful), np.array(mean_ms)
+    tied = np.flatnonzero(useful >= useful.max() - tie_margin)
+    plan: Plan = hedged[tied[mean_ms[tied].argmin()]]
+    return Always(HEDGE, plan)
 
 
 def decision_microseconds(rule: Rule, scenario: Scenario, repeats: int = 20000) -> float:
@@ -164,6 +225,9 @@ def run_setup(table: Measurements, setup: Setup, *, every_variant: bool = True) 
                 "device_busy_ms": run["device_busy_ms"],
                 "total_ms": run["total_ms"],
                 "correct": correct,
+                "local_correct": run["local_correct"].astype(bool),
+                "server_at_ms": run["server_at_ms"],
+                "server_correct": run["server_correct"].astype(bool),
                 "useful": correct & (run["total_ms"] <= setup.deadline_ms),
                 "rule": name,
             }
@@ -174,7 +238,7 @@ def run_setup(table: Measurements, setup: Setup, *, every_variant: bool = True) 
     def add_rule(rule: Rule, plans: str, **extra: object) -> None:
         trace = simulate(rule, scenario, setup.knowledge)
         traces.append(trace.assign(rule=rule.name))
-        scores = score_trace(trace, setup.deadline_ms)
+        scores = score_trace(trace, setup.deadline_ms, setup.horizon_ms)
         rows.append({"rule": rule.name, "kind": "rule", "plans": plans, **scores, **extra})
 
     simple = simple_rules(
@@ -185,7 +249,7 @@ def run_setup(table: Measurements, setup: Setup, *, every_variant: bool = True) 
 
     for variant in variants(tuning_scenario, scenario, every=every_variant):
         traces.append(as_trace(variant.name, variant.outcome).assign(plan=variant.played()))
-        scores = score_run(variant.outcome, setup.deadline_ms)
+        scores = score_run(variant.outcome, setup.deadline_ms, setup.horizon_ms)
         rows.append(
             {"rule": variant.name, "kind": variant.kind, "plans": variant.describe(), **scores}
         )
@@ -199,9 +263,19 @@ def run_setup(table: Measurements, setup: Setup, *, every_variant: bool = True) 
         chosen += f"; a frame is sent when the network was last seen {ours.probe_every} frames ago"
     add_rule(ours, chosen, decide_us=decision_microseconds(ours, scenario))
 
-    for name, plans, run in ladder_runs(scenario):
+    if setup.hedge:
+        hedge = tuned_hedge(tuning_scenario)
+        add_rule(hedge, hedge.plan.describe())
+        hedged = tuned_lookup(tuning, tuning_scenario, setup, name=OURS_HEDGED, hedge=True)
+        chosen = "; ".join(
+            f"{name}: {hedged.plan_for(network, setup.deadline_ms).describe()}"
+            for name, network in zip(setup.names, scenario.networks, strict=True)
+        )
+        add_rule(hedged, chosen, decide_us=decision_microseconds(hedged, scenario))
+
+    for name, plans, run in ladder_runs(scenario, hedge=setup.hedge):
         traces.append(as_trace(name, run))
-        scores = score_run(run, setup.deadline_ms)
+        scores = score_run(run, setup.deadline_ms, setup.horizon_ms)
         rows.append({"rule": name, "kind": "yardstick", "plans": plans, **scores})
 
     board = pd.DataFrame(rows)
