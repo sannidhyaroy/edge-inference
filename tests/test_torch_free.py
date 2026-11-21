@@ -21,6 +21,7 @@ DEVICE_SIDE = (
     "scoreboard",
     "manifest",
     "preprocess",
+    "menu",
     "signals",
 )
 

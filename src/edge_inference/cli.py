@@ -241,6 +241,92 @@ def cmd_data_origin(args: argparse.Namespace) -> int:
     return 0
 
 
+IMAGENETV2_ROOT = DATA_DIR / "imagenetv2" / "imagenetv2-matched-frequency-format-val"
+MENU_DIR = CHECKPOINT_DIR / "menu"
+MENU_MANIFEST = Path("manifests/imagenetv2_mf.csv")
+
+
+def cmd_menu_manifest(args: argparse.Namespace) -> int:
+    """Fix ImageNetV2's tuning, test and calibration images once, in a manifest."""
+    from edge_inference.menu import check_manifest, imagenetv2_manifest
+
+    root = Path(args.root)
+    table = imagenetv2_manifest(root)
+    check_manifest(table)
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    table.to_csv(out, index=False)
+    console.print(
+        f"Wrote [bold]{out}[/bold]: {len(table)} images in {table['label'].nunique()} classes, "
+        + ", ".join(f"{n} {split}" for split, n in table["split"].value_counts().items())
+        + f", {int(table['calibration'].sum())} for calibration"
+    )
+    return 0
+
+
+def cmd_menu_export(args: argparse.Namespace) -> int:
+    """Export each model at each resolution, with its recipe and an INT8 copy."""
+    from edge_inference.menu import check_manifest
+    from edge_inference.zoo import build, export_variant
+
+    table = pd.read_csv(args.manifest)
+    root = Path(args.root)
+    check_manifest(table, root)
+    rng = np.random.default_rng(SEED)
+    pool = table.loc[table["calibration"], "file"].to_numpy()
+    calibration = [root / f for f in rng.choice(pool, size=args.calibration_images, replace=False)]
+    for name in args.models:
+        model = build(name)
+        for resolution in args.resolutions:
+            paths = export_variant(
+                name, resolution, Path(args.out), calibration=calibration, model=model
+            )
+            console.print(f"{name}@{resolution}: " + ", ".join(p.name for p in paths.values()))
+    return 0
+
+
+def cmd_menu_answers(args: argparse.Namespace) -> int:
+    """Record what every exported variant answers for every image, per model."""
+    from concurrent.futures import ProcessPoolExecutor
+
+    from edge_inference.menu import answer_variant
+    from edge_inference.zoo import variant_path
+
+    table = pd.read_csv(args.manifest)
+    root, directory = Path(args.root), Path(args.dir)
+    jobs = []
+    for name in args.models:
+        for resolution in args.resolutions:
+            sessions = {
+                precision: variant_path(directory, name, resolution, precision)
+                for precision in ("float32", "int8")
+                if variant_path(directory, name, resolution, precision).exists()
+            }
+            if sessions:
+                jobs.append((name, resolution, sessions))
+
+    with ProcessPoolExecutor(args.workers) as pool:
+        work = [
+            (directory, name, res, sessions, table, root, args.threads)
+            for name, res, sessions in jobs
+        ]
+        found = pd.concat(pool.map(answer_variant, work), ignore_index=True)
+    results = Path(args.results)
+    for name, frame in found.groupby("model"):
+        out = results / f"menu_answers_{name}.csv.gz"
+        frame.to_csv(out, index=False)
+        console.print(f"Wrote [bold]{out}[/bold]")
+    summary = (
+        found.groupby(["model", "resolution", "precision", "split"])["correct"]
+        .mean()
+        .unstack("split")
+        .mul(100)
+        .round(2)
+    )
+    console.print(summary.to_string())
+    return 0
+
+
 def cmd_train(args: argparse.Namespace) -> int:
     """Fine-tune a pretrained backbone on Imagenette and save the weights."""
     seed_everything()
@@ -1600,6 +1686,41 @@ def build_parser() -> argparse.ArgumentParser:
     origin.add_argument("--manifest", default="manifests/imagenette_val.csv")
     origin.add_argument("--results", default=str(RESULTS_DIR))
     origin.set_defaults(func=cmd_data_origin)
+
+    menu = subparsers.add_parser("menu", help="pretrained models on ImageNetV2, for the menu")
+    menu_sub = menu.add_subparsers(dest="menu_command", required=True)
+    menu_manifest = menu_sub.add_parser(
+        "manifest", help="fix the tuning, test and calibration images once"
+    )
+    menu_manifest.add_argument("--root", default=str(IMAGENETV2_ROOT))
+    menu_manifest.add_argument("--out", default=str(MENU_MANIFEST))
+    menu_manifest.set_defaults(func=cmd_menu_manifest)
+
+    menu_export = menu_sub.add_parser("export", help="export models at resolutions, with INT8")
+    menu_export.add_argument("--models", type=lambda s: s.split(","), required=True)
+    menu_export.add_argument(
+        "--resolutions", type=lambda s: [int(v) for v in s.split(",")], default=[224]
+    )
+    menu_export.add_argument("--calibration-images", type=int, default=256)
+    menu_export.add_argument("--manifest", default=str(MENU_MANIFEST))
+    menu_export.add_argument("--root", default=str(IMAGENETV2_ROOT))
+    menu_export.add_argument("--out", default=str(MENU_DIR))
+    menu_export.set_defaults(func=cmd_menu_export)
+
+    menu_answers = menu_sub.add_parser(
+        "answers", help="what every exported variant answers for every image"
+    )
+    menu_answers.add_argument("--models", type=lambda s: s.split(","), required=True)
+    menu_answers.add_argument(
+        "--resolutions", type=lambda s: [int(v) for v in s.split(",")], default=[224]
+    )
+    menu_answers.add_argument("--threads", type=int, default=2)
+    menu_answers.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) // 2))
+    menu_answers.add_argument("--manifest", default=str(MENU_MANIFEST))
+    menu_answers.add_argument("--root", default=str(IMAGENETV2_ROOT))
+    menu_answers.add_argument("--dir", default=str(MENU_DIR))
+    menu_answers.add_argument("--results", default=str(RESULTS_DIR))
+    menu_answers.set_defaults(func=cmd_menu_answers)
 
     train = subparsers.add_parser("train", help="fine-tune a backbone on Imagenette")
     train.add_argument("--backbone", default="resnet18", choices=SUPPORTED_BACKBONES)
