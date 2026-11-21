@@ -15,13 +15,34 @@ Numbers are guesses with a range, not targets.
 1. Over the 16 device-speed and deadline cells, with three seeds, hedging
    without any knowledge of the network scores at least the fair target
    (rung 3) in 12 or more cells, and is never more than 0.5 points below it.
+
+   **Failed on the count, held on the margin.** Hedging reaches rung 3 in 9
+   cells of 16, beating it by up to 2.12 points where deciding pays, and is
+   never more than 0.11 points below it on average over seeds (0.19 on the
+   worst seed). It needs no knowledge of the network to get there.
+   (`decide_sweep_..._hedge.csv`)
 2. The lookup rule over the family that includes hedged plans reaches rung 3h
    within 0.3 points in every cell.
+
+   **Held** on cell means: at most 0.17 points apart. One seed in one cell
+   was 0.33 points apart.
 3. Rung 3h is above rung 3 by more than one point only in cells where some
    frames on the good network miss the deadline when sent.
+
+   **Held.** Rung 3h is more than a point above rung 3 only at 4x with 20 ms
+   (2.20) and 8x with 30 ms (1.19); everywhere else the gap is at most 0.68.
 4. Hedging keeps the device busy at least 1.8 times as long as the lookup
    rule in the cells where the lookup rule sends; cancellation recovers more
    than half of that difference.
+
+   **Failed.** In 8 of the 13 cells where the lookup rule sends, hedging keeps
+   the device busy 1.98 to 2.18 times as long; in 4 it picks a cheaper local
+   plan and is busy for less. Cancelling at the next exit recovers at most
+   52% of the gap, and none of it where deciding pays: the server's answer
+   arrives during the first stage, which already holds 54.7% of the network's
+   work, so there is no earlier exit to stop at. Stopping inside a stage would
+   recover more; the live runtime will measure it.
+   (`decide_sweep_..._hedge-cancel.csv`)
 
 ## The device menu (ImageNetV2, float32, 224 px)
 
