@@ -50,6 +50,7 @@ from edge_inference.export import (
     verify_parity,
     verify_stage_parity,
 )
+from edge_inference.manifest import IMAGENET_TRAIN, IMAGENET_VAL, accuracy_by_origin, manifest
 from edge_inference.models import (
     EXIT_NAMES,
     SUPPORTED_BACKBONES,
@@ -168,6 +169,55 @@ def cmd_data_prepare(args: argparse.Namespace) -> int:
     console.print(table)
 
     console.print(f"On disk: [bold]{directory_size_mb(root):.1f} MiB[/bold]")
+    return 0
+
+
+def cmd_data_origin(args: argparse.Namespace) -> int:
+    """Where each test image came from in ImageNet, and accuracy by origin.
+
+    The backbone is ImageNet-pretrained and most Imagenette test images are
+    ImageNet training images. If the pretraining had inflated accuracy, the
+    few images ImageNet kept for validation would score lower than the rest.
+    """
+    root = Path(args.root)
+    dataset = load_split("val", root=root)
+    images = manifest(image_files(dataset), [label for _, label in dataset._samples], root=root)
+    out = Path(args.manifest)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    images.to_csv(out, index=False)
+    counts = images["origin"].value_counts()
+    console.print(
+        f"Wrote [bold]{out}[/bold]: {len(images)} images, "
+        + ", ".join(f"{count} from {where}" for where, count in counts.items())
+    )
+
+    results = Path(args.results)
+    tables = []
+    for profile in args.profiles:
+        frame = pd.read_csv(profile)
+        stem = Path(profile).name.removesuffix(".gz").removesuffix(".csv")
+        stem = stem.removeprefix("exit_profile_")
+        tables.append(accuracy_by_origin(frame, images).assign(profile=stem))
+    if not tables:
+        return 0
+    table = pd.concat(tables, ignore_index=True)
+    by_origin = results / "accuracy_by_origin.csv"
+    table.to_csv(by_origin, index=False)
+
+    view = Table(title="Accuracy by ImageNet origin, 95% interval")
+    for column in ("profile", "exit", "ImageNet train", "ImageNet val", "val minus train"):
+        view.add_column(column, justify="left" if column == "profile" else "right")
+    for (stem, exit_name), group in table.groupby(["profile", "exit_name"], sort=False):
+        rows = group.set_index("origin")
+        cells = [
+            f"{rows.at[where, 'accuracy'] * 100:.2f} "
+            f"({rows.at[where, 'ci_low'] * 100:.1f} to {rows.at[where, 'ci_high'] * 100:.1f})"
+            for where in (IMAGENET_TRAIN, IMAGENET_VAL)
+        ]
+        gap = (rows.at[IMAGENET_VAL, "accuracy"] - rows.at[IMAGENET_TRAIN, "accuracy"]) * 100
+        view.add_row(stem, exit_name, *cells, f"{gap:+.2f}")
+    console.print(view)
+    console.print(f"Wrote [bold]{by_origin}[/bold]")
     return 0
 
 
@@ -1471,6 +1521,14 @@ def build_parser() -> argparse.ArgumentParser:
     prepare = data_sub.add_parser("prepare", help="download and verify Imagenette")
     prepare.add_argument("--root", default=str(DATA_DIR), help="dataset directory")
     prepare.set_defaults(func=cmd_data_prepare)
+    origin = data_sub.add_parser(
+        "origin", help="label test images by ImageNet origin and compare accuracy"
+    )
+    origin.add_argument("profiles", nargs="*", help="exit profiles to break down by origin")
+    origin.add_argument("--root", default=str(DATA_DIR), help="dataset directory")
+    origin.add_argument("--manifest", default="manifests/imagenette_val.csv")
+    origin.add_argument("--results", default=str(RESULTS_DIR))
+    origin.set_defaults(func=cmd_data_origin)
 
     train = subparsers.add_parser("train", help="fine-tune a backbone on Imagenette")
     train.add_argument("--backbone", default="resnet18", choices=SUPPORTED_BACKBONES)
