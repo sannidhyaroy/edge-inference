@@ -49,6 +49,7 @@ from edge_inference.yardsticks import ladder_runs, score_run
 FAIR_TARGET = "3. best confidence rule per network"
 OURS = "lookup (ours)"
 HEDGE = "hedge, no network knowledge"
+HEDGED_TARGET = "3h. best plan per network, hedges included"
 OURS_HEDGED = "lookup with hedging"
 
 # How old a sighting of the network may get before a frame is sent to refresh
@@ -93,6 +94,11 @@ class Setup:
             tag += f"_stay{self.stay_good:g}-{self.stay_bad:g}"
         if self.knowledge != "exact":
             tag += f"_{self.knowledge.replace(':', '')}"
+        return tag + self.extras()
+
+    def extras(self) -> str:
+        """The part of the tag for hedging, the horizon and prices; empty by default."""
+        tag = ""
         if self.hedge:
             tag += "_hedge" + ("-cancel" if self.cancel else "")
         if self.horizon_ms != HORIZON_MS:

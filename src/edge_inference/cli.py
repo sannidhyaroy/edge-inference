@@ -73,9 +73,26 @@ from edge_inference.quantization import (
     quantize_onnx,
 )
 from edge_inference.runtime import Device, LiveRun, Responder, compare, connect, serve
-from edge_inference.scoreboard import FAIR_TARGET, OURS, Setup, grid, run_setup, run_sweep
+from edge_inference.scoreboard import (
+    FAIR_TARGET,
+    HEDGE,
+    HEDGED_TARGET,
+    OURS,
+    OURS_HEDGED,
+    Setup,
+    grid,
+    run_setup,
+    run_sweep,
+)
 from edge_inference.server import OnnxServer, TorchServer, profile_server
-from edge_inference.simulate import Measurements, Plan, Scenario, simulate, split_images
+from edge_inference.simulate import (
+    HORIZON_MS,
+    Measurements,
+    Plan,
+    Scenario,
+    simulate,
+    split_images,
+)
 from edge_inference.split import profile_splits
 from edge_inference.training import fine_tune
 
@@ -1081,6 +1098,7 @@ def cmd_decide_evaluate(args: argparse.Namespace) -> int:
         passes=args.passes,
         tune_share=args.tune_share,
         seed=args.seed,
+        **hedge_settings(args),
     )
     result = run_setup(Measurements.from_components(components, args.server), setup)
     board, scenario = result.board, result.scenario
@@ -1156,6 +1174,7 @@ def cmd_decide_sweep(args: argparse.Namespace) -> int:
         knowledge=args.knowledge,
         passes=args.passes,
         seed=args.seed,
+        **hedge_settings(args),
     )
     setups = grid(base, slowdowns=args.slowdowns, deadlines=args.deadlines, seeds=args.seeds)
     console.print(f"Scoring {len(setups)} setups on {args.workers} processes")
@@ -1169,6 +1188,8 @@ def cmd_decide_sweep(args: argparse.Namespace) -> int:
         "1. best fixed option": "best fixed",
         FAIR_TARGET: "fair target",
     }
+    if args.hedge:
+        shown |= {HEDGE: "hedge", OURS_HEDGED: "ours, hedged", HEDGED_TARGET: "3h"}
     useful = (
         boards[boards["rule"].isin(shown)]
         .groupby(["slowdown", "deadline_ms", "rule"], sort=False)["useful"]
@@ -1203,6 +1224,7 @@ def cmd_decide_sweep(args: argparse.Namespace) -> int:
         tag += f"_stay{args.stay:g}"
     if args.knowledge != "exact":
         tag += f"_{args.knowledge.replace(':', '')}"
+    tag += base.extras()
     out = results / f"decide_sweep_{tag}.csv"
     boards.to_csv(out, index=False)
     console.print(f"Wrote [bold]{out}[/bold] ({len(boards)} rows)")
@@ -1507,6 +1529,48 @@ def cmd_bench(args: argparse.Namespace) -> int:
         )
 
     return 0
+
+
+def add_hedge_arguments(parser: argparse.ArgumentParser) -> None:
+    """Flags for hedged plans, the record horizon and prices, shared by evaluate and sweep."""
+    parser.add_argument(
+        "--hedge",
+        action="store_true",
+        help="add hedged plans: send the photo and compute locally at once",
+    )
+    parser.add_argument(
+        "--cancel",
+        action="store_true",
+        help="stop a hedged local run at the next exit once the server has answered",
+    )
+    parser.add_argument(
+        "--horizon",
+        type=float,
+        default=HORIZON_MS,
+        help="ms until which a late answer still corrects the record",
+    )
+    parser.add_argument(
+        "--price-busy",
+        type=float,
+        default=0.0,
+        help="useful share the lookup rules give up per ms of device time",
+    )
+    parser.add_argument(
+        "--price-kb",
+        type=float,
+        default=0.0,
+        help="useful share the lookup rules give up per kB sent",
+    )
+
+
+def hedge_settings(args: argparse.Namespace) -> dict[str, object]:
+    return {
+        "hedge": args.hedge,
+        "cancel": args.cancel,
+        "horizon_ms": args.horizon,
+        "price_busy": args.price_busy,
+        "price_kb": args.price_kb,
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1896,6 +1960,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="share of each class held out for choosing settings; 0 scores every image",
     )
     decide_evaluate.add_argument("--seed", type=int, default=SEED)
+    add_hedge_arguments(decide_evaluate)
     decide_evaluate.set_defaults(func=cmd_decide_evaluate)
 
     decide_sweep = decide_sub.add_parser(
@@ -1934,6 +1999,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=max(1, (os.cpu_count() or 2) // 2),
         help="setups scored at once (default: half the logical cores)",
     )
+    add_hedge_arguments(decide_sweep)
     decide_sweep.set_defaults(func=cmd_decide_sweep)
 
     serve_parser = subparsers.add_parser(
