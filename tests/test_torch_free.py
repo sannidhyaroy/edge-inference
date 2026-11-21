@@ -22,6 +22,9 @@ DEVICE_SIDE = (
     "manifest",
     "preprocess",
     "menu",
+    "wire",
+    "serving",
+    "probe",
     "signals",
 )
 
