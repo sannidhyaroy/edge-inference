@@ -38,11 +38,13 @@ Numbers are guesses with a range, not targets.
    **Failed.** In 8 of the 13 cells where the lookup rule sends, hedging keeps
    the device busy 1.98 to 2.18 times as long; in 4 it picks a cheaper local
    plan and is busy for less. Cancelling at the next exit recovers at most
-   52% of the gap, and none of it where deciding pays: the server's answer
-   arrives during the first stage, which already holds 54.7% of the network's
-   work, so there is no earlier exit to stop at. Stopping inside a stage would
-   recover more; the live runtime will measure it.
-   (`decide_sweep_..._hedge-cancel.csv`)
+   52% of the gap, and none of it where deciding pays: there the local plan is
+   a single stage, the server's answer arrives inside it, and the next exit is
+   the end of the plan. Stopping the moment the answer arrives does better: it
+   recovers 46% at 8x with 20 and 30 ms, 72% at 16x, and more than half in 6
+   of the 13 cells, with the same answers. It assumes aborting a running graph
+   costs nothing, which the live runtime will measure.
+   (`decide_sweep_..._hedge-cancel.csv`, `decide_sweep_..._hedge-cancel-now.csv`)
 
 ## The device menu (ImageNetV2, float32, 224 px)
 
