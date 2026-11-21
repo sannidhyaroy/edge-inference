@@ -17,12 +17,17 @@ Whatever a plan in the family does to a frame, some fixed plan does the same
 or better on that frame: stopping at an exit is "run locally to that exit",
 and sending after a failed check is a fixed send plus wasted device time. That
 is why choosing among fixed plans per frame, with the answer key, bounds every
-rule.
+rule. A hedged plan is no exception: by its deadline it has either the
+server's answer, which sending alone would have had as soon, or its own,
+which running alone would have had no later.
+
+Both sets are read off the table: its variants, how many exits each has, and
+which photo and feature routes it holds.
 """
 
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import product
 
 import numpy as np
@@ -30,18 +35,15 @@ import numpy as np
 from edge_inference.decide import TIE_MARGIN
 from edge_inference.offload import Network
 from edge_inference.simulate import (
+    ANSWER,
     FEATURES,
-    FINAL,
-    PAYLOADS,
     PHOTO,
-    PRECISIONS,
     Feedback,
     Measurements,
     Plan,
     View,
     resolve,
 )
-from edge_inference.split import SPLIT_NAMES
 
 OFFLOAD = Plan()
 
@@ -50,35 +52,73 @@ OFFLOAD = Plan()
 THRESHOLDS = tuple(round(0.05 * step, 2) for step in range(1, 20))
 
 
-def fixed_plans() -> list[Plan]:
+def _photo_routes(measurements: Measurements) -> list[str | None]:
+    """How plans name the photo routes: not at all when there is only one."""
+    keys = measurements.photo_routes
+    return [None] if len(keys) == 1 else keys
+
+
+def _depths(measurements: Measurements, variant: str) -> list[int | None]:
+    """A variant's exits, shallowest first, with the final exit as `None`."""
+    final = measurements.final(variant)
+    return [*range(final), None]
+
+
+def _features_after(measurements: Measurements, variant: str, exit: int) -> list[str]:
+    """The feature payloads profiled after `exit` of `variant`, in table order."""
+    return [
+        route.payload for route in measurements.routes.values() if route.after == (variant, exit)
+    ]
+
+
+def fixed_plans(measurements: Measurements) -> list[Plan]:
     """One plan per plain option: no confidence checks anywhere."""
-    plans = [OFFLOAD]
-    plans += [Plan(precision, depth) for precision in PRECISIONS for depth in range(FINAL + 1)]
+    plans = [Plan(route=route) for route in _photo_routes(measurements)]
     plans += [
-        Plan("float32", depth, otherwise=FEATURES, payload=payload)
-        for depth in range(len(SPLIT_NAMES))
-        for payload in PAYLOADS
+        Plan(variant, depth)
+        for variant in measurements.local
+        for depth in _depths(measurements, variant)
+    ]
+    plans += [
+        Plan(route.after[0], route.after[1], otherwise=FEATURES, payload=route.payload)
+        for route in measurements.routes.values()
+        if route.after is not None
     ]
     return plans
 
 
-def plan_family(thresholds: Sequence[float] = THRESHOLDS) -> list[Plan]:
-    """Every fixed plan, and every plan that stops or sends on confidence."""
+def plan_family(
+    measurements: Measurements, thresholds: Sequence[float] = THRESHOLDS, *, hedge: bool = False
+) -> list[Plan]:
+    """Every fixed plan, and every plan that stops or sends on confidence.
+
+    With `hedge`, every plan that ends in a local answer also comes in a hedged
+    form, sending the photo by each route as it starts.
+    """
     levels = (*thresholds, math.inf)
-    plans = [OFFLOAD]
-    for precision in PRECISIONS:
-        for depth in range(FINAL + 1):
+    routes = _photo_routes(measurements)
+    plans = [Plan(route=route) for route in routes]
+    for variant in measurements.local:
+        final = measurements.final(variant)
+        for depth in range(final + 1):
             for earlier in product(levels, repeat=depth):
-                plans.append(Plan(precision, depth, earlier))
-                if depth == FINAL:
+                plans.append(Plan(variant, None if depth == final else depth, earlier))
+                if depth == final:
                     continue
                 for last in levels:
-                    plans.append(Plan(precision, depth, (*earlier, last), otherwise=PHOTO))
-                    if precision == "float32" and depth < len(SPLIT_NAMES):
-                        plans += [
-                            Plan(precision, depth, (*earlier, last), FEATURES, payload)
-                            for payload in PAYLOADS
-                        ]
+                    checks = (*earlier, last)
+                    plans += [Plan(variant, depth, checks, PHOTO, route=r) for r in routes]
+                    plans += [
+                        Plan(variant, depth, checks, FEATURES, payload)
+                        for payload in _features_after(measurements, variant, depth)
+                    ]
+    if hedge:
+        plans += [
+            replace(plan, route=route, hedge=True)
+            for plan in list(plans)
+            if plan.precision is not None and plan.otherwise == ANSWER
+            for route in routes
+        ]
     return plans
 
 
@@ -104,21 +144,39 @@ def best_plan(
     slowdown: float,
     deadline_ms: float,
     tie_margin: float = TIE_MARGIN,
+    prices: tuple[float, float] = (0.0, 0.0),
+    cancel: bool = False,
 ) -> Plan:
-    """The fastest plan among those within `tie_margin` of the top useful share.
+    """The plan with the best useful share, net of `prices`, on the tuning images.
 
     Every image in `measurements` meets the same `network`. This is how
-    settings are chosen on the tuning images.
+    settings are chosen on the tuning images. `prices` charges for device time
+    (per ms) and for bytes sent (per kB), in units of useful share: with both
+    at zero, which is the default, only the useful share counts. Plans within
+    `tie_margin` of the best count as tied; among them the cheapest wins, or
+    with no prices the fastest.
     """
     rows = np.arange(len(measurements))
-    useful, mean_ms = [], []
+    per_ms, per_kb = prices
+    value, tiebreak = [], []
     for plan in plans:
-        outcome = resolve(measurements, plan, rows, network.rtt_ms, network.uplink_mbps, slowdown)
-        useful.append((outcome.correct & (outcome.total_ms <= deadline_ms)).mean())
-        mean_ms.append(outcome.total_ms.mean())
-    useful, mean_ms = np.array(useful), np.array(mean_ms)
-    tied = np.flatnonzero(useful >= useful.max() - tie_margin)
-    return plans[tied[mean_ms[tied].argmin()]]
+        outcome = resolve(
+            measurements,
+            plan,
+            rows,
+            network.rtt_ms,
+            network.uplink_mbps,
+            slowdown,
+            deadline_ms=deadline_ms,
+            cancel=cancel,
+        )
+        useful = (outcome.correct & (outcome.total_ms <= deadline_ms)).mean()
+        cost = per_ms * outcome.device_busy_ms.mean() + per_kb * outcome.sent_bytes.mean() / 1000
+        value.append(useful - cost)
+        tiebreak.append(cost if per_ms or per_kb else outcome.total_ms.mean())
+    value, tiebreak = np.array(value), np.array(tiebreak)
+    tied = np.flatnonzero(value >= value.max() - tie_margin)
+    return plans[tied[tiebreak[tied].argmin()]]
 
 
 def tuned_threshold(
@@ -135,7 +193,8 @@ def tuned_threshold(
     This is confidence-based early exit as it is usually described: a single
     threshold, the same at every exit, and no sending.
     """
-    plans = [Plan(precision, FINAL, (t,) * FINAL) for t in thresholds]
+    earlier = measurements.final(precision)
+    plans = [Plan(precision, None, (t,) * earlier) for t in thresholds]
     plan = best_plan(measurements, plans, network, slowdown=slowdown, deadline_ms=deadline_ms)
     return Always(f"early exit {precision}, threshold {plan.thresholds[0]:g}", plan)
 
@@ -144,14 +203,15 @@ def simple_rules(
     tuning: Measurements, network: Network, *, slowdown: float, deadline_ms: float
 ) -> list[Always]:
     """The baselines: always one plain option, or early exit with one threshold."""
-    rules = [
-        Always("always local float32", Plan("float32")),
-        Always("always local int8", Plan("int8")),
-        Always("always offload", OFFLOAD),
+    rules = [Always(f"always local {variant}", Plan(variant)) for variant in tuning.local]
+    rules += [
+        Always("always offload" + (f" via {route}" if route else ""), Plan(route=route))
+        for route in _photo_routes(tuning)
     ]
     rules += [
-        tuned_threshold(tuning, precision, network, slowdown=slowdown, deadline_ms=deadline_ms)
-        for precision in PRECISIONS
+        tuned_threshold(tuning, variant, network, slowdown=slowdown, deadline_ms=deadline_ms)
+        for variant in tuning.local
+        if tuning.final(variant) > 0
     ]
     return rules
 
@@ -179,10 +239,16 @@ class Lookup:
     name: str
     tuning: Measurements
     slowdown: float
-    plans: Sequence[Plan] = field(default_factory=plan_family)
+    plans: Sequence[Plan] | None = None
     tie_margin: float = TIE_MARGIN
     probe_every: int | None = None
     table: dict[tuple[float, float, float], Plan] = field(default_factory=dict)
+    prices: tuple[float, float] = (0.0, 0.0)
+    cancel: bool = False
+
+    def __post_init__(self) -> None:
+        if self.plans is None:
+            self.plans = plan_family(self.tuning)
 
     def plan_for(self, network: Network, deadline_ms: float) -> Plan:
         """The plan to play under `network`, worked out once and then remembered."""
@@ -195,13 +261,15 @@ class Lookup:
                 slowdown=self.slowdown,
                 deadline_ms=deadline_ms,
                 tie_margin=self.tie_margin,
+                prices=self.prices,
+                cancel=self.cancel,
             )
         return self.table[key]
 
     def choose(self, view: View) -> Plan:
         stale = self.probe_every is not None and view.network_age >= self.probe_every
         if view.network is None or stale:
-            return OFFLOAD
+            return Plan(route=_photo_routes(self.tuning)[0])
         return self.plan_for(view.network, view.deadline_ms)
 
     def observe(self, feedback: Feedback) -> None:

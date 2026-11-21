@@ -24,7 +24,7 @@ from edge_inference.bandit import (
     variants,
 )
 from edge_inference.offload import Network
-from edge_inference.simulate import FEATURES, FINAL, PHOTO, Plan, Scenario, simulate
+from edge_inference.simulate import FEATURES, PHOTO, Plan, Scenario, simulate
 
 BAD = Network(rtt_ms=100, uplink_mbps=8)
 
@@ -46,7 +46,7 @@ def test_each_arm_runs_to_one_exit_and_sends_if_unsure():
 
     assert first == Plan("float32", 0, (0.5,), FEATURES)
     assert second == Plan("float32", 1, (math.inf, 0.7), FEATURES)
-    assert last == Plan("float32", FINAL)
+    assert last == Plan("float32")
 
 
 def test_the_arms_can_be_widened():
@@ -54,7 +54,7 @@ def test_the_arms_can_be_widened():
 
     assert plans[0] == Plan()
     assert plans[1] == Plan("int8", 0, (0.5,), PHOTO)
-    assert plans[-1] == Plan("int8", FINAL)
+    assert plans[-1] == Plan("int8")
     assert [arm_label(plan) for plan in plans] == ["offload", "exit 1", "exit 2", "final exit"]
 
 

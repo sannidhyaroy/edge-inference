@@ -43,7 +43,6 @@ from edge_inference.server import _decode_jpeg, _receive_float32, _receive_uint8
 from edge_inference.simulate import (
     ANSWER,
     FEATURES,
-    FINAL,
     PHOTO,
     Outcome,
     Plan,
@@ -236,17 +235,19 @@ class Device:
         if plan.precision is None:
             return send_photo()
 
-        thresholds = (*plan.thresholds, *[float("inf")] * (plan.depth + 1))
-        for depth in range(plan.depth + 1):
+        final = len(self.sessions[plan.precision]) - 1
+        target = final if plan.depth is None else plan.depth
+        thresholds = (*plan.thresholds, *[float("inf")] * (target + 1))
+        for depth in range(target + 1):
             outputs, took = self._paced(
                 lambda d=depth, x=x: run_stage(self.sessions[plan.precision][d], x)
             )
             busy += took
             x = outputs.get(FEATURES_NAME)
             predicted, confidences[depth] = answer(outputs[OUTPUT_NAME][0])
-            last = depth == plan.depth
+            last = depth == target
             if confidences[depth] >= thresholds[depth] or (
-                last and (depth == FINAL or plan.otherwise == ANSWER)
+                last and (depth == final or plan.otherwise == ANSWER)
             ):
                 return finish(predicted, depth, None, 0, 0.0)
 
@@ -329,14 +330,22 @@ class LiveRun:
                     "in_time": measured.total_ms <= scenario.deadline_ms,
                 }
             )
+        sent = measured.sent_bytes > 0
+        right = bool(measured.predicted == label)
         return Outcome(
             total_ms=np.array([measured.total_ms]),
-            correct=np.array([measured.predicted == label]),
+            correct=np.array([right]),
             device_busy_ms=np.array([measured.device_busy_ms]),
             sent_bytes=np.array([float(measured.sent_bytes)]),
             answered_at=np.array([measured.answered_at]),
             confidences=np.array([measured.confidences]),
             server_confidence=np.array([measured.server_confidence]),
+            # One answer per frame here: the device's, or the server's once it
+            # arrived. A hedged run that keeps both is the protocol's next step.
+            local_ms=np.array([np.inf if sent else measured.total_ms]),
+            local_correct=np.array([not sent and right]),
+            server_at_ms=np.array([measured.total_ms if sent else np.inf]),
+            server_correct=np.array([sent and right]),
         )
 
 

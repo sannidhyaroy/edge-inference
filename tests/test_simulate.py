@@ -20,6 +20,7 @@ from edge_inference.simulate import (
     Plan,
     Scenario,
     View,
+    feature_route,
     frame_stream,
     markov_states,
     resolve,
@@ -41,14 +42,16 @@ def test_the_table_is_reshaped_per_image():
     table = Measurements.from_components(components(), "t4")
 
     assert list(table.images) == [0, 1]
-    assert table.device_ms["float32"].tolist() == [[2.0, 4.0, 6.0]] * 2
-    assert table.device_ms["int8"].tolist() == [[1.0, 2.0, 3.0]] * 2
-    assert table.photo_bytes.tolist() == [1000, 1000]
-    assert table.photo_server_ms.tolist() == [4.0, 4.0]
-    assert table.features_bytes["uint8_zstd"].tolist() == [[500, 500]] * 2
-    assert table.features_server_ms["float32"].tolist() == [[1.5, 1.5]] * 2
+    assert table.local["float32"].ms.tolist() == [[2.0, 4.0, 6.0]] * 2
+    assert table.local["int8"].ms.tolist() == [[1.0, 2.0, 3.0]] * 2
+    photo = table.photo_route(None)
+    assert photo.bytes.tolist() == [1000, 1000]
+    assert photo.server_ms.tolist() == [4.0, 4.0]
+    packed = [table.routes[feature_route("float32", split, "uint8_zstd")] for split in (0, 1)]
+    assert [route.bytes.tolist() for route in packed] == [[500, 500]] * 2
+    assert table.routes[feature_route("float32", 1, "float32")].server_ms.tolist() == [1.5, 1.5]
     # The server gets image 1 wrong after an 8-bit payload.
-    assert table.features_correct["uint8_zstd"].tolist() == [[True, True], [False, False]]
+    assert [route.correct.tolist() for route in packed] == [[True, False]] * 2
 
 
 def test_a_frame_stops_at_the_first_confident_exit():
@@ -108,10 +111,16 @@ def test_only_reached_exits_report_a_confidence():
 
 
 def test_plans_the_profiles_cannot_answer_are_refused():
+    # Feature maps were profiled for float32 only, and there is no fourth exit.
     with pytest.raises(ValueError):
-        Plan("int8", 0, (0.5,), FEATURES)
+        run(Plan("int8", 0, (0.5,), FEATURES))
     with pytest.raises(ValueError):
-        Plan("float32", FINAL + 1)
+        run(Plan("float32", FINAL + 1))
+    # The final exit always answers, and a hedge needs a local answer.
+    with pytest.raises(ValueError):
+        Plan("float32", None, (), PHOTO)
+    with pytest.raises(ValueError):
+        Plan(hedge=True)
 
 
 def test_plans_describe_themselves():

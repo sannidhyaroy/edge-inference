@@ -1,10 +1,8 @@
 """Checks that the four yardsticks are what they claim, and never cross."""
 
-import dataclasses
-
 import numpy as np
 
-from builders import CONFIDENCE, NETWORK, measurements
+from builders import CONFIDENCE, NETWORK, arrays, measurements
 from edge_inference.offload import Network
 from edge_inference.policies import Always, plan_family
 from edge_inference.simulate import Measurements, Scenario, markov_states, score_trace, simulate
@@ -46,17 +44,18 @@ def test_watching_the_network_beats_any_fixed_option():
 def test_confidence_helps_when_a_deeper_exit_is_wrong():
     # Image 0 is right and sure at the first exit and wrong afterwards; image 1
     # is right only at the final exit. No single exit gets both.
-    table = measurements().subset(np.array([0, 1]))
     correct = np.array([[True, False, False], [False, False, True]])
-    table = dataclasses.replace(
-        table,
-        correct={"float32": correct, "int8": correct},
-        confidence={"float32": CONFIDENCE[:2], "int8": CONFIDENCE[:2]},
-        photo_correct=np.array([False, False]),
-        features_correct={
-            "float32": np.zeros((2, 2), dtype=bool),
-            "uint8_zstd": np.zeros((2, 2), dtype=bool),
-        },
+    table = Measurements.from_arrays(
+        **{
+            **arrays(slice(0, 2)),
+            "correct": {"float32": correct, "int8": correct},
+            "confidence": {"float32": CONFIDENCE[:2], "int8": CONFIDENCE[:2]},
+            "photo_correct": np.array([False, False]),
+            "features_correct": {
+                "float32": np.zeros((2, 2), dtype=bool),
+                "uint8_zstd": np.zeros((2, 2), dtype=bool),
+            },
+        }
     )
     scores = useful(ladder(scenario(table, [1, 1], slowdown=1.0, deadline_ms=20)))
 
@@ -82,7 +81,7 @@ def random_table(rng, images=40):
     def flags(shape):
         return rng.random(shape) < 0.6
 
-    return Measurements(
+    return Measurements.from_arrays(
         images=np.arange(images),
         labels=np.zeros(images, dtype=int),
         device_ms={"float32": exits(), "int8": exits()},
@@ -112,7 +111,7 @@ def test_the_rungs_never_cross_and_no_rule_beats_the_top():
         scores = ladder(run, thresholds=(0.3, 0.6))["useful"].to_numpy()
         assert (np.diff(scores) >= 0).all(), scores
 
-        plans = plan_family((0.3, 0.6))
+        plans = plan_family(table, (0.3, 0.6))
         for plan in [plans[i] for i in rng.choice(len(plans), 12, replace=False)]:
             trace = simulate(Always("one plan", plan), run)
             assert score_trace(trace, run.deadline_ms)["useful"] <= scores[-1]

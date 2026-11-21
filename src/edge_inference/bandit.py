@@ -64,13 +64,18 @@ def arm_plans(
         Plan(precision, depth, (*[math.inf] * depth, thresholds[depth]), otherwise)
         for depth in range(FINAL)
     ]
-    return [*plans, Plan(precision, FINAL)]
+    return [*plans, Plan(precision)]
+
+
+def exit_index(plan: Plan) -> int:
+    """The exit a plan runs to, counted from zero; the final exit when it says none."""
+    return FINAL if plan.depth is None else plan.depth
 
 
 def arm_label(plan: Plan) -> str:
     if plan.precision is None:
         return "offload"
-    return "final exit" if plan.depth == FINAL else f"exit {plan.depth + 1}"
+    return "final exit" if exit_index(plan) == FINAL else f"exit {plan.depth + 1}"
 
 
 class UCB:
@@ -147,7 +152,7 @@ class Settings:
 
 def layers_run(plan: Plan) -> int:
     """Layers the device runs under a plan: none when the photo is sent at once."""
-    return 0 if plan.precision is None else EXIT_LAYERS[plan.depth]
+    return 0 if plan.precision is None else EXIT_LAYERS[exit_index(plan)]
 
 
 def reward(
@@ -188,7 +193,7 @@ class Bandit:
     def observe(self, feedback: Feedback) -> None:
         plan = self.plans[self.arm]
         confidence = (
-            feedback.server_confidence if feedback.sent else feedback.confidences[plan.depth]
+            feedback.server_confidence if feedback.sent else feedback.confidences[exit_index(plan)]
         )
         self.ucb.update(
             self.arm,
@@ -209,13 +214,16 @@ class Arms:
     confidence: np.ndarray
     # Layers the device runs under each arm, one entry per arm.
     layers: np.ndarray
+    local_correct: np.ndarray
+    server_at_ms: np.ndarray
+    server_correct: np.ndarray
 
     @classmethod
     def of(cls, scenario: Scenario, plans: Sequence[Plan]) -> Arms:
         outcomes = [scenario.resolve(plan) for plan in plans]
         frames = np.arange(len(scenario.frames))
         confidence = [
-            np.where(o.sent_bytes > 0, o.server_confidence, o.confidences[frames, plan.depth])
+            np.where(o.sent_bytes > 0, o.server_confidence, o.confidences[frames, exit_index(plan)])
             for plan, o in zip(plans, outcomes, strict=True)
         ]
 
@@ -229,6 +237,9 @@ class Arms:
             sent_bytes=stack("sent_bytes"),
             confidence=np.stack(confidence, axis=1),
             layers=np.array([layers_run(plan) for plan in plans]),
+            local_correct=stack("local_correct"),
+            server_at_ms=stack("server_at_ms"),
+            server_correct=stack("server_correct"),
         )
 
     def rewards(
@@ -266,7 +277,15 @@ def run(arms: Arms, chosen: np.ndarray) -> dict[str, np.ndarray]:
     frames = np.arange(len(chosen))
     return {
         name: getattr(arms, name)[frames, chosen]
-        for name in ("total_ms", "correct", "device_busy_ms", "sent_bytes")
+        for name in (
+            "total_ms",
+            "correct",
+            "device_busy_ms",
+            "sent_bytes",
+            "local_correct",
+            "server_at_ms",
+            "server_correct",
+        )
     }
 
 
@@ -409,7 +428,7 @@ def offload_cost_in_layers(scenario: Scenario) -> dict[str, float]:
     and get an answer, over the median time the device needs per layer.
     """
     send_all = Plan("float32", 0, (math.inf,), FEATURES)
-    final = scenario.resolve(Plan("float32", FINAL))
+    final = scenario.resolve(Plan("float32"))
     per_layer = np.median(final.total_ms) / EXIT_LAYERS[FINAL]
     sent = scenario.resolve(send_all)
     reach = scenario.resolve(Plan("float32", 0))

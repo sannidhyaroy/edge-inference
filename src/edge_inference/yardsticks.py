@@ -19,6 +19,17 @@ the same networks the rules met.
 Each is at least as good as the one before, by construction. The gaps are the
 finding: 1 to 2 is what watching the network is worth, 2 to 3 what confidence
 is worth, and 3 to 4 the price of not knowing the answer.
+
+When hedged plans are in play, one rung goes between 3 and 4:
+
+3h. **Best plan per network, hedges included.** The same search as 3 over a
+    family that also sends the photo while computing. 3 to 3h is what doing
+    both at once is worth to a rule that knows the network.
+
+And one more for applications that keep a record rather than act once:
+
+4r. **Best possible record per frame.** For each frame, whether any plain
+    option's final answer, the server's if it arrives by the horizon, is right.
 """
 
 from collections.abc import Sequence
@@ -27,9 +38,17 @@ import numpy as np
 import pandas as pd
 
 from edge_inference.policies import THRESHOLDS, fixed_plans, plan_family
-from edge_inference.simulate import Outcome, Plan, Scenario, score
+from edge_inference.simulate import HORIZON_MS, Outcome, Plan, Scenario, score
 
-FIELDS = ("total_ms", "correct", "device_busy_ms", "sent_bytes")
+FIELDS = (
+    "total_ms",
+    "correct",
+    "device_busy_ms",
+    "sent_bytes",
+    "local_correct",
+    "server_at_ms",
+    "server_correct",
+)
 
 
 def _best_per_group(
@@ -64,7 +83,8 @@ def _best_per_group(
 
 def _best_per_frame(scenario: Scenario) -> dict[str, np.ndarray]:
     """For each frame, the fastest plain option that is useful, else the fastest."""
-    outcomes: list[Outcome] = [scenario.resolve(plan) for plan in fixed_plans()]
+    plans = fixed_plans(scenario.measurements)
+    outcomes: list[Outcome] = [scenario.resolve(plan) for plan in plans]
     total = np.stack([o.total_ms for o in outcomes])
     correct = np.stack([o.correct for o in outcomes])
     useful = correct & (total <= scenario.deadline_ms)
@@ -75,49 +95,98 @@ def _best_per_frame(scenario: Scenario) -> dict[str, np.ndarray]:
     return {name: np.stack([getattr(o, name) for o in outcomes])[pick, frames] for name in FIELDS}
 
 
+def _best_record_per_frame(scenario: Scenario) -> dict[str, np.ndarray]:
+    """For each frame, a plain option whose final answer is right, if any is."""
+    plans = fixed_plans(scenario.measurements)
+    outcomes = [scenario.resolve(plan) for plan in plans]
+    final = np.stack(
+        [
+            np.where(o.server_at_ms <= scenario.horizon_ms, o.server_correct, o.local_correct)
+            for o in outcomes
+        ]
+    )
+    total = np.stack([o.total_ms for o in outcomes])
+    pick = np.where(final.any(axis=0), np.where(final, total, np.inf).argmin(axis=0), 0)
+    frames = np.arange(total.shape[1])
+    return {name: np.stack([getattr(o, name) for o in outcomes])[pick, frames] for name in FIELDS}
+
+
 def ladder_runs(
-    scenario: Scenario, thresholds: Sequence[float] = THRESHOLDS
+    scenario: Scenario, thresholds: Sequence[float] = THRESHOLDS, *, hedge: bool = False
 ) -> list[tuple[str, str, dict[str, np.ndarray]]]:
-    """The four yardsticks, weakest first: a name, what was chosen, and the run per frame."""
+    """The yardsticks, weakest first: a name, what was chosen, and the run per frame.
+
+    With `hedge`, rung 3h and the record rung 4r join the four.
+    """
     whole_run = np.zeros(len(scenario.frames), dtype=int)
+    table = scenario.measurements
 
     def named(plans: Sequence[Plan]) -> str:
         return "; ".join(
             f"{scenario.state_names[state]}: {plan.describe()}" for state, plan in enumerate(plans)
         )
 
-    (plan,), fixed = _best_per_group(scenario, fixed_plans(), whole_run)
-    per_state, by_network = _best_per_group(scenario, fixed_plans(), scenario.states)
-    family, by_confidence = _best_per_group(scenario, plan_family(thresholds), scenario.states)
-    return [
+    (plan,), fixed = _best_per_group(scenario, fixed_plans(table), whole_run)
+    per_state, by_network = _best_per_group(scenario, fixed_plans(table), scenario.states)
+    family, by_confidence = _best_per_group(
+        scenario, plan_family(table, thresholds), scenario.states
+    )
+    runs = [
         ("1. best fixed option", plan.describe(), fixed),
         ("2. best option per network", named(per_state), by_network),
         ("3. best confidence rule per network", named(family), by_confidence),
-        ("4. best possible per frame", "chosen per frame", _best_per_frame(scenario)),
     ]
+    if hedge:
+        hedged, by_hedge = _best_per_group(
+            scenario, plan_family(table, thresholds, hedge=True), scenario.states
+        )
+        runs.append(("3h. best plan per network, hedges included", named(hedged), by_hedge))
+    runs.append(("4. best possible per frame", "chosen per frame", _best_per_frame(scenario)))
+    if hedge:
+        runs.append(
+            (
+                "4r. best possible record per frame",
+                "chosen per frame",
+                _best_record_per_frame(scenario),
+            )
+        )
+    return runs
 
 
-def score_run(run: dict[str, np.ndarray], deadline_ms: float) -> dict[str, float]:
+def score_run(
+    run: dict[str, np.ndarray], deadline_ms: float, horizon_ms: float = HORIZON_MS
+) -> dict[str, float]:
     """`score` for a run held as one array per field."""
+    events = {}
+    if "server_at_ms" in run:
+        events = {
+            "local_correct": run["local_correct"].astype(bool),
+            "server_at_ms": run["server_at_ms"],
+            "server_correct": run["server_correct"].astype(bool),
+        }
     return score(
         run["total_ms"],
         run["correct"].astype(bool),
         run["device_busy_ms"],
         run["sent_bytes"],
         deadline_ms,
+        horizon_ms=horizon_ms,
+        **events,
     )
 
 
-def ladder(scenario: Scenario, thresholds: Sequence[float] = THRESHOLDS) -> pd.DataFrame:
-    """Score the four yardsticks on a scenario, weakest first."""
+def ladder(
+    scenario: Scenario, thresholds: Sequence[float] = THRESHOLDS, *, hedge: bool = False
+) -> pd.DataFrame:
+    """Score the yardsticks on a scenario, weakest first."""
     return pd.DataFrame(
         [
             {
                 "rule": name,
                 "kind": "yardstick",
                 "plans": plans,
-                **score_run(run, scenario.deadline_ms),
+                **score_run(run, scenario.deadline_ms, scenario.horizon_ms),
             }
-            for name, plans, run in ladder_runs(scenario, thresholds)
+            for name, plans, run in ladder_runs(scenario, thresholds, hedge=hedge)
         ]
     )

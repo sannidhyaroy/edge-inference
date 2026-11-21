@@ -14,7 +14,7 @@ from edge_inference.policies import (
     simple_rules,
     tuned_threshold,
 )
-from edge_inference.simulate import FINAL, Plan, View, resolve
+from edge_inference.simulate import Plan, View, resolve
 
 ROWS = np.arange(4)
 BAD = Network(rtt_ms=100, uplink_mbps=8)
@@ -27,18 +27,18 @@ def behaviour(plan):
 
 def test_there_is_one_fixed_plan_per_plain_option():
     # Offload, 3 exits x 2 precisions, 2 split points x 2 payloads.
-    assert len(fixed_plans()) == 1 + 6 + 4
-    assert OFFLOAD in fixed_plans()
+    assert len(fixed_plans(measurements())) == 1 + 6 + 4
+    assert OFFLOAD in fixed_plans(measurements())
 
 
 def test_the_family_contains_every_fixed_plan():
-    family = {behaviour(plan) for plan in plan_family((0.5,))}
+    family = {behaviour(plan) for plan in plan_family(measurements(), (0.5,))}
 
-    assert all(behaviour(plan) in family for plan in fixed_plans())
+    assert all(behaviour(plan) in family for plan in fixed_plans(measurements()))
 
 
 def test_the_family_grows_with_the_thresholds():
-    assert len(plan_family((0.5,))) < len(plan_family((0.3, 0.5)))
+    assert len(plan_family(measurements(), (0.5,))) < len(plan_family(measurements(), (0.3, 0.5)))
 
 
 def test_a_simple_rule_always_returns_its_plan():
@@ -67,7 +67,7 @@ def test_the_threshold_is_chosen_on_the_tuning_images():
 
     # At 0.1 every image stops at the first exit, right once. At 0.85 images
     # stop where they are first right, and three of four are answered correctly.
-    assert rule.plan == Plan("int8", FINAL, (0.85, 0.85))
+    assert rule.plan == Plan("int8", None, (0.85, 0.85))
     assert rule.name == "early exit int8, threshold 0.85"
 
 
@@ -94,7 +94,7 @@ def test_the_lookup_rule_plays_a_different_plan_per_network():
     # and running int8 to the end is right on three.
     assert rule.plan_for(NETWORK, deadline_ms=16) == OFFLOAD
     local = rule.plan_for(BAD, deadline_ms=16)
-    assert local.precision == "int8" and local.depth == FINAL
+    assert local.precision == "int8" and local.depth is None
 
     outcome = resolve(measurements(), local, ROWS, BAD.rtt_ms, BAD.uplink_mbps, 3.0)
     assert outcome.correct.mean() == 0.75

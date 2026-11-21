@@ -19,10 +19,16 @@ reveals nothing.
 * ``probe:N``: the network as it was at the last probe, one every N frames.
 * ``sends``: the network as it was the last time this rule sent anything, or
   nothing at all before its first send.
+
+**A frame is a timeline, not one answer.** `resolve` records when the device's
+own answer was ready and whether it was right, and when the server's arrived
+and whether it was right. What the frame is worth depends on the application:
+an answer by the deadline for something that acts once, or the best answer by
+a later horizon for something that keeps a record. `score` reads both.
 """
 
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -33,6 +39,8 @@ from edge_inference.models import EXIT_NAMES
 from edge_inference.offload import Network
 from edge_inference.split import SPLIT_NAMES
 
+# The early-exit table: two precisions of one network with three exits, and
+# feature maps at the first two. Other tables bring their own variants and routes.
 PRECISIONS = ("float32", "int8")
 PAYLOADS = ("float32", "uint8_zstd")
 FINAL = len(EXIT_NAMES) - 1
@@ -41,40 +49,153 @@ FINAL = len(EXIT_NAMES) - 1
 # confident enough: answer anyway, send the feature map, or send the photo.
 ANSWER, FEATURES, PHOTO = "answer", "features", "photo"
 
+# The horizon a record is kept open for: a late answer that arrives by then
+# still replaces the one shown.
+HORIZON_MS = 1000.0
+
+
+@dataclass(frozen=True)
+class Local:
+    """One way of running the network on the device: arrays of images by exits.
+
+    `ms` is cumulative device time to each exit, shallowest first.
+    """
+
+    ms: np.ndarray
+    confidence: np.ndarray
+    correct: np.ndarray
+    exit_names: tuple[str, ...]
+
+    @property
+    def final(self) -> int:
+        return len(self.exit_names) - 1
+
+
+@dataclass(frozen=True)
+class Route:
+    """One way of sending a frame to a server: arrays with one entry per image.
+
+    A photo route sends the photo; a feature route sends the feature map the
+    device computed up to `after`, a (variant, exit) pair. `correct` and
+    `confidence` are the server's own.
+    """
+
+    bytes: np.ndarray
+    prepare_ms: np.ndarray
+    server_ms: np.ndarray
+    correct: np.ndarray
+    confidence: np.ndarray
+    payload: str = PHOTO
+    server: str = "server"
+    link: str = "net"
+    after: tuple[str, int] | None = None
+
+
+def feature_route(variant: str, exit: int, payload: str) -> str:
+    """The key of the route that sends `variant`'s feature map after `exit`."""
+    return f"features:{payload}@{variant}/{exit}"
+
 
 @dataclass(frozen=True)
 class Measurements:
-    """The per-image table for one server, as arrays with one row per image.
+    """The per-image table, as arrays with one row per image.
 
-    Local arrays have a column per exit, shallowest first. Feature arrays have
-    a column per split point. Feature maps come from the float32 device only,
-    which is all the profiles measured.
+    `local` has a block per variant (a precision, or a model at a resolution
+    and precision), `routes` a block per way of sending.
     """
 
     images: np.ndarray
     labels: np.ndarray
-    device_ms: dict[str, np.ndarray]
-    confidence: dict[str, np.ndarray]
-    correct: dict[str, np.ndarray]
-    photo_bytes: np.ndarray
-    photo_server_ms: np.ndarray
-    photo_correct: np.ndarray
-    features_bytes: dict[str, np.ndarray]
-    features_prepare_ms: dict[str, np.ndarray]
-    features_server_ms: dict[str, np.ndarray]
-    features_correct: dict[str, np.ndarray]
+    local: Mapping[str, Local]
+    routes: Mapping[str, Route]
 
     def __len__(self) -> int:
         return len(self.images)
 
+    def final(self, variant: str) -> int:
+        return self.local[variant].final
+
+    @property
+    def photo_routes(self) -> list[str]:
+        return [key for key, route in self.routes.items() if route.after is None]
+
+    def photo_route(self, key: str | None) -> Route:
+        """The route a plan sends its photo by: named, or the only one there is."""
+        if key is not None:
+            return self.routes[key]
+        keys = self.photo_routes
+        if len(keys) != 1:
+            raise ValueError(f"name the photo route: there are {len(keys)}")
+        return self.routes[keys[0]]
+
+    @classmethod
+    def from_arrays(
+        cls,
+        *,
+        images: np.ndarray,
+        labels: np.ndarray,
+        device_ms: Mapping[str, np.ndarray],
+        confidence: Mapping[str, np.ndarray],
+        correct: Mapping[str, np.ndarray],
+        photo_bytes: np.ndarray,
+        photo_server_ms: np.ndarray,
+        photo_correct: np.ndarray,
+        features_bytes: Mapping[str, np.ndarray],
+        features_prepare_ms: Mapping[str, np.ndarray],
+        features_server_ms: Mapping[str, np.ndarray],
+        features_correct: Mapping[str, np.ndarray],
+        server: str = "server",
+        link: str = "net",
+    ) -> Measurements:
+        """The early-exit table's shape: precisions of one network, one photo, feature maps.
+
+        The profiles did not record the server's confidence. The server runs
+        the float32 network to its final exit, so the device's own confidence
+        there stands in for it, on every route.
+        """
+        exits = tuple(EXIT_NAMES[: next(iter(device_ms.values())).shape[1]])
+        local = {
+            precision: Local(device_ms[precision], confidence[precision], correct[precision], exits)
+            for precision in device_ms
+        }
+        from_server = confidence["float32"][:, -1]
+        routes = {
+            PHOTO: Route(
+                photo_bytes,
+                np.zeros(len(images)),
+                photo_server_ms,
+                photo_correct,
+                from_server,
+                server=server,
+                link=link,
+            )
+        }
+        splits = next(iter(features_bytes.values())).shape[1] if features_bytes else 0
+        for split in range(splits):
+            for payload in features_bytes:
+                routes[feature_route("float32", split, payload)] = Route(
+                    features_bytes[payload][:, split],
+                    features_prepare_ms[payload][:, split],
+                    features_server_ms[payload][:, split],
+                    features_correct[payload][:, split],
+                    from_server,
+                    payload=payload,
+                    server=server,
+                    link=link,
+                    after=("float32", split),
+                )
+        return cls(np.asarray(images), np.asarray(labels), local, routes)
+
     @classmethod
     def from_components(cls, components: pd.DataFrame, server: str) -> Measurements:
-        """Reshape the rows for `server`, and the local rows, into arrays."""
+        """The early-exit long table: the local rows and the rows for `server`, as arrays.
 
-        def wide(frame: pd.DataFrame, value: str, columns: Sequence[str]) -> np.ndarray:
-            return frame.pivot(index="image", columns="point", values=value)[
-                list(columns)
-            ].to_numpy()
+        Every block is pivoted on the image, and every block must hold the same
+        images, so nothing is aligned by position alone.
+        """
+
+        def wide(frame: pd.DataFrame, value: str, columns: Sequence[str]) -> pd.DataFrame:
+            return frame.pivot(index="image", columns="point", values=value)[list(columns)]
 
         components = components.assign(
             server_ms=components["server_receive_ms"] + components["server_compute_ms"]
@@ -85,37 +206,63 @@ class Measurements:
         photo = sent[sent["mode"] == "offload"].set_index("image").sort_index()
         by_payload = {p: sent[(sent["mode"] == "split") & (sent["payload"] == p)] for p in PAYLOADS}
 
-        return cls(
-            images=photo.index.to_numpy(),
+        index = photo.index
+        if not index.is_unique:
+            raise ValueError("an image appears twice among the photo rows")
+
+        def aligned(block: pd.DataFrame) -> np.ndarray:
+            if not block.index.equals(index):
+                raise ValueError("the blocks of the table do not hold the same images")
+            return block.to_numpy()
+
+        labels = local.drop_duplicates("image").set_index("image")["label"].sort_index()
+        if not labels.index.equals(index) or not (labels.to_numpy() == photo["label"]).all():
+            raise ValueError("local and sent rows disagree on the images or their labels")
+
+        return cls.from_arrays(
+            images=index.to_numpy(),
             labels=photo["label"].to_numpy(),
-            device_ms={p: wide(f, "device_ms", EXIT_NAMES) for p, f in by_precision.items()},
-            confidence={p: wide(f, "confidence", EXIT_NAMES) for p, f in by_precision.items()},
-            correct={p: wide(f, "correct", EXIT_NAMES) for p, f in by_precision.items()},
+            device_ms={
+                p: aligned(wide(f, "device_ms", EXIT_NAMES)) for p, f in by_precision.items()
+            },
+            confidence={
+                p: aligned(wide(f, "confidence", EXIT_NAMES)) for p, f in by_precision.items()
+            },
+            correct={p: aligned(wide(f, "correct", EXIT_NAMES)) for p, f in by_precision.items()},
             photo_bytes=photo["payload_bytes"].to_numpy(),
             photo_server_ms=photo["server_ms"].to_numpy(),
             photo_correct=photo["correct"].to_numpy(),
             features_bytes={
-                p: wide(f, "payload_bytes", SPLIT_NAMES) for p, f in by_payload.items()
+                p: aligned(wide(f, "payload_bytes", SPLIT_NAMES)) for p, f in by_payload.items()
             },
             features_prepare_ms={
-                p: wide(f, "prepare_ms", SPLIT_NAMES) for p, f in by_payload.items()
+                p: aligned(wide(f, "prepare_ms", SPLIT_NAMES)) for p, f in by_payload.items()
             },
             features_server_ms={
-                p: wide(f, "server_ms", SPLIT_NAMES) for p, f in by_payload.items()
+                p: aligned(wide(f, "server_ms", SPLIT_NAMES)) for p, f in by_payload.items()
             },
-            features_correct={p: wide(f, "correct", SPLIT_NAMES) for p, f in by_payload.items()},
+            features_correct={
+                p: aligned(wide(f, "correct", SPLIT_NAMES)) for p, f in by_payload.items()
+            },
+            server=server,
         )
 
     def subset(self, rows: np.ndarray) -> Measurements:
         """The same table restricted to `rows`, a boolean mask or an index array."""
 
-        def take(value):
-            if isinstance(value, dict):
-                return {key: array[rows] for key, array in value.items()}
-            return value[rows]
+        def take(block):
+            return type(block)(
+                **{
+                    name: value[rows] if isinstance(value, np.ndarray) else value
+                    for name, value in vars(block).items()
+                }
+            )
 
         return Measurements(
-            **{name: take(getattr(self, name)) for name in self.__dataclass_fields__}
+            self.images[rows],
+            self.labels[rows],
+            {key: take(block) for key, block in self.local.items()},
+            {key: take(route) for key, route in self.routes.items()},
         )
 
 
@@ -124,49 +271,72 @@ class Plan:
     """What to do with one frame.
 
     With no `precision` the photo is sent at once. Otherwise the device runs
-    the network in that precision up to exit `depth`, counted from zero. On the
-    way it stops and answers at the first exit whose confidence reaches that
-    exit's entry in `thresholds`; a missing entry means never stop there. At
-    `depth` itself, without enough confidence, it does `otherwise`. The final
-    exit always answers: a network cannot decline to produce an output.
+    that variant of the network up to exit `depth`, counted from zero; `None`
+    means the final exit. On the way it stops and answers at the first exit
+    whose confidence reaches that exit's entry in `thresholds`; a missing entry
+    means never stop there. At `depth` itself, without enough confidence, it
+    does `otherwise`. The final exit always answers: a network cannot decline
+    to produce an output.
+
+    `route` names the photo route when the table has more than one. A plan
+    that `hedge`s sends the photo the moment the frame arrives and runs its
+    local part at the same time; the frame gets whichever answer serves it.
     """
 
     precision: str | None = None
-    depth: int = FINAL
+    depth: int | None = None
     thresholds: tuple[float, ...] = ()
     otherwise: str = ANSWER
     payload: str = "uint8_zstd"
+    route: str | None = None
+    hedge: bool = False
 
     def __post_init__(self) -> None:
-        if self.precision is None:
-            return
-        if not 0 <= self.depth <= FINAL:
-            raise ValueError(f"depth must be between 0 and {FINAL}")
-        if self.otherwise == FEATURES and (
-            self.precision != "float32" or self.depth >= len(SPLIT_NAMES)
-        ):
-            raise ValueError("feature maps were profiled for float32 at the split points only")
+        if self.depth is not None and self.depth < 0:
+            raise ValueError("depth counts exits from zero")
+        if self.otherwise != ANSWER and self.depth is None:
+            raise ValueError("the final exit always answers, so it has nothing to fall back on")
+        if self.hedge and (self.precision is None or self.otherwise != ANSWER):
+            raise ValueError("a hedge pairs a sent photo with a local answer")
+
+    def final_at(self, final: int) -> bool:
+        """Whether this plan runs to the final exit of a variant whose last exit is `final`."""
+        return self.depth is None or self.depth == final
 
     def describe(self) -> str:
+        via = f" via {self.route}" if self.route is not None else ""
         if self.precision is None:
-            return "offload"
-        padded = (*self.thresholds, *[math.inf] * (self.depth + 1))[: self.depth + 1]
-        checks = self.depth + (self.otherwise != ANSWER and self.depth != FINAL)
-        stops = [f"{t:g}" for t in padded[:checks] if t != math.inf]
-        where = "final exit" if self.depth == FINAL else f"exit {self.depth + 1}"
+            return f"offload{via}"
+        final = self.depth is None or self.depth == FINAL
+        if final:
+            stops = [f"{t:g}" for t in self.thresholds if t != math.inf]
+        else:
+            padded = (*self.thresholds, *[math.inf] * (self.depth + 1))[: self.depth + 1]
+            checks = self.depth + (self.otherwise != ANSWER)
+            stops = [f"{t:g}" for t in padded[:checks] if t != math.inf]
+        where = "final exit" if final else f"exit {self.depth + 1}"
         text = f"{self.precision} to {where}"
         if stops:
             text += f", stop at {'/'.join(stops)}"
-        if self.depth != FINAL and self.otherwise == PHOTO:
-            text += ", else send photo"
-        if self.depth != FINAL and self.otherwise == FEATURES:
+        if not final and self.otherwise == PHOTO:
+            text += f", else send photo{via}"
+        if not final and self.otherwise == FEATURES:
             text += f", else send {self.payload} features"
+        if self.hedge:
+            text += f", photo sent alongside{via}"
         return text
 
 
 @dataclass(frozen=True)
 class Outcome:
-    """What happened to each frame; every field is an array with one entry per frame."""
+    """What happened to each frame; every field is an array with one entry per frame.
+
+    `total_ms` and `correct` are the answer the frame was given at the time it
+    was given, which is what something that acts once sees. The events behind
+    them are kept too: when the device's own answer was ready and whether it
+    was right, and when the server's answer arrived and whether it was right.
+    An event that never happened has time `inf` and is not right.
+    """
 
     total_ms: np.ndarray
     correct: np.ndarray
@@ -178,6 +348,10 @@ class Outcome:
     confidences: np.ndarray
     # Confidence the server reports with its answer; NaN when nothing was sent.
     server_confidence: np.ndarray
+    local_ms: np.ndarray
+    local_correct: np.ndarray
+    server_at_ms: np.ndarray
+    server_correct: np.ndarray
 
 
 def resolve(
@@ -187,75 +361,190 @@ def resolve(
     rtt_ms: np.ndarray | float,
     uplink_mbps: np.ndarray | float,
     slowdown: float = 1.0,
+    *,
+    deadline_ms: float | None = None,
+    cancel: bool = False,
 ) -> Outcome:
-    """Carry out `plan` on the images at `rows`, each over its own network."""
+    """Carry out `plan` on the images at `rows`, each over its own network.
+
+    A hedged plan needs `deadline_ms`: until then the device waits for the
+    server, and only then gives its own answer. With `cancel`, a hedged local
+    run stops at the next exit once the server's answer is in.
+    """
     rows = np.asarray(rows)
     count = len(rows)
     # `Network` only does arithmetic, so it takes one value per frame as well.
     network = Network(rtt_ms=rtt_ms, uplink_mbps=uplink_mbps)
-    no_exit = np.full((count, len(EXIT_NAMES)), np.nan)
-    # The profiles did not record the server's confidence. The server runs the
-    # float32 network to its final exit, so the device's own confidence there
-    # stands in for it.
-    from_server = measurements.confidence["float32"][rows, FINAL]
+    never = np.full(count, np.inf)
+    nothing = np.zeros(count, dtype=bool)
 
     if plan.precision is None:
-        size = measurements.photo_bytes[rows]
+        route = measurements.photo_route(plan.route)
+        size = route.bytes[rows]
+        prepare = slowdown * route.prepare_ms[rows]
+        arrives = prepare + network.transfer_ms(size) + route.server_ms[rows]
+        right = route.correct[rows].astype(bool)
+        width = max(block.final for block in measurements.local.values()) + 1
         return Outcome(
-            total_ms=network.transfer_ms(size) + measurements.photo_server_ms[rows],
-            correct=measurements.photo_correct[rows],
-            device_busy_ms=np.zeros(count),
+            total_ms=arrives,
+            correct=right,
+            device_busy_ms=prepare,
             sent_bytes=size,
             answered_at=np.full(count, -1),
-            confidences=no_exit,
-            server_confidence=from_server,
+            confidences=np.full((count, width), np.nan),
+            server_confidence=route.confidence[rows],
+            local_ms=never,
+            local_correct=nothing,
+            server_at_ms=arrives,
+            server_correct=right,
         )
 
-    depth = plan.depth
-    reached = measurements.confidence[plan.precision][rows, : depth + 1]
+    block = measurements.local[plan.precision]
+    final = block.final
+    depth = final if plan.depth is None else plan.depth
+    if depth > final:
+        raise ValueError(f"{plan.precision} has exits 0 to {final}, not {depth}")
+    reached = block.confidence[rows, : depth + 1]
     thresholds = np.array((*plan.thresholds, *[math.inf] * (depth + 1))[: depth + 1])
     confident = reached >= thresholds
-    if depth == FINAL or plan.otherwise == ANSWER:
+    if depth == final or plan.otherwise == ANSWER:
         confident[:, depth] = True
     answers = confident.any(axis=1)
     # argmax on booleans gives the first True; a row with none stops at `depth`.
     stopped = np.where(answers, confident.argmax(axis=1), depth)
 
-    busy = slowdown * measurements.device_ms[plan.precision][rows, stopped]
+    local_busy = slowdown * block.ms[rows, stopped]
+    local_right = block.correct[rows, stopped].astype(bool)
+    confidences = np.full((count, final + 1), np.nan)
+    confidences[:, : depth + 1] = reached
+    confidences[np.arange(final + 1) > stopped[:, None]] = np.nan
+
+    if plan.hedge:
+        return _hedge(
+            measurements,
+            plan,
+            rows,
+            network,
+            slowdown,
+            deadline_ms,
+            cancel,
+            block,
+            stopped,
+            local_busy,
+            local_right,
+            confidences,
+        )
+
+    busy = local_busy
     total = busy.copy()
-    correct = measurements.correct[plan.precision][rows, stopped].copy()
+    correct = local_right.copy()
     sent_bytes = np.zeros(count)
     answered_at = stopped.copy()
+    server_at = never
+    server_right = nothing
+    server_confidence = np.full(count, np.nan)
 
     sends = ~answers
     if sends.any():
         if plan.otherwise == PHOTO:
-            size = measurements.photo_bytes[rows]
-            prepare = np.zeros(count)
-            server = measurements.photo_server_ms[rows]
-            right = measurements.photo_correct[rows]
+            route = measurements.photo_route(plan.route)
         else:
-            size = measurements.features_bytes[plan.payload][rows, depth]
-            prepare = slowdown * measurements.features_prepare_ms[plan.payload][rows, depth]
-            server = measurements.features_server_ms[plan.payload][rows, depth]
-            right = measurements.features_correct[plan.payload][rows, depth]
+            key = feature_route(plan.precision, depth, plan.payload)
+            if key not in measurements.routes:
+                raise ValueError(f"no feature map was profiled for {plan.describe()}")
+            route = measurements.routes[key]
+        size = route.bytes[rows]
+        prepare = slowdown * route.prepare_ms[rows]
         busy = busy + np.where(sends, prepare, 0.0)
-        total = busy + np.where(sends, network.transfer_ms(size) + server, 0.0)
-        correct = np.where(sends, right, correct)
+        arrives = busy + network.transfer_ms(size) + route.server_ms[rows]
+        total = np.where(sends, arrives, busy)
+        correct = np.where(sends, route.correct[rows], correct).astype(bool)
         sent_bytes = np.where(sends, size, 0.0)
         answered_at = np.where(sends, -1, stopped)
+        server_at = np.where(sends, arrives, np.inf)
+        server_right = sends & route.correct[rows].astype(bool)
+        server_confidence = np.where(sends, route.confidence[rows], np.nan)
 
-    confidences = no_exit
-    confidences[:, : depth + 1] = reached
-    confidences[np.arange(len(EXIT_NAMES)) > stopped[:, None]] = np.nan
     return Outcome(
         total_ms=total,
-        correct=correct.astype(bool),
+        correct=correct,
         device_busy_ms=busy,
         sent_bytes=sent_bytes,
         answered_at=answered_at,
         confidences=confidences,
-        server_confidence=np.where(sends, from_server, np.nan),
+        server_confidence=server_confidence,
+        local_ms=local_busy,
+        local_correct=local_right,
+        server_at_ms=server_at,
+        server_correct=server_right,
+    )
+
+
+def _hedge(
+    measurements: Measurements,
+    plan: Plan,
+    rows: np.ndarray,
+    network: Network,
+    slowdown: float,
+    deadline_ms: float | None,
+    cancel: bool,
+    block: Local,
+    stopped: np.ndarray,
+    local_busy: np.ndarray,
+    local_right: np.ndarray,
+    confidences: np.ndarray,
+) -> Outcome:
+    """Send the photo and run the local part at once; answer with whichever serves.
+
+    The device encodes the photo first, then computes while the photo travels.
+    By the deadline, the server's answer is given if it has arrived; otherwise
+    the device's own answer is given at the deadline, since until then the
+    device cannot know the server will be late. If both miss the deadline, the
+    first to arrive is given.
+    """
+    if deadline_ms is None:
+        raise ValueError("a hedged plan is resolved against a deadline")
+    route = measurements.photo_route(plan.route)
+    size = route.bytes[rows]
+    prepare = slowdown * route.prepare_ms[rows]
+    server_at = prepare + network.transfer_ms(size) + route.server_ms[rows]
+    local_at = prepare + local_busy
+    server_right = route.correct[rows].astype(bool)
+
+    server_first = server_at <= deadline_ms
+    local_in_time = ~server_first & (local_at <= deadline_ms)
+    late = ~server_first & ~local_in_time
+    late_server = late & (server_at <= local_at)
+    by_server = server_first | late_server
+    total = np.where(
+        server_first,
+        server_at,
+        np.where(local_in_time, deadline_ms, np.minimum(server_at, local_at)),
+    )
+    correct = np.where(by_server, server_right, local_right)
+
+    busy = local_at
+    if cancel:
+        # The device stops at the first exit it reaches after the answer is in.
+        boundaries = prepare[:, None] + slowdown * block.ms[rows]
+        reached = boundaries >= server_at[:, None]
+        first = np.where(reached.any(axis=1), reached.argmax(axis=1), block.final)
+        first = np.minimum(first, stopped)
+        cut = boundaries[np.arange(len(rows)), first]
+        busy = np.where(server_at < local_at, cut, local_at)
+
+    return Outcome(
+        total_ms=total,
+        correct=correct,
+        device_busy_ms=busy,
+        sent_bytes=size,
+        answered_at=np.where(by_server, -1, stopped),
+        confidences=confidences,
+        server_confidence=route.confidence[rows],
+        local_ms=local_at,
+        local_correct=local_right,
+        server_at_ms=server_at,
+        server_correct=server_right,
     )
 
 
@@ -343,6 +632,9 @@ class Scenario:
     state_names: Sequence[str]
     slowdown: float
     deadline_ms: float
+    horizon_ms: float = HORIZON_MS
+    # Whether a hedged local run stops once the server's answer is in.
+    cancel: bool = False
     rtt_ms: np.ndarray = field(init=False)
     uplink_mbps: np.ndarray = field(init=False)
 
@@ -362,6 +654,8 @@ class Scenario:
             self.rtt_ms[at],
             self.uplink_mbps[at],
             self.slowdown,
+            deadline_ms=self.deadline_ms,
+            cancel=self.cancel,
         )
 
 
@@ -432,6 +726,9 @@ def simulate(
                 "device_busy_ms": float(outcome.device_busy_ms[0]),
                 "total_ms": float(outcome.total_ms[0]),
                 "correct": bool(outcome.correct[0]),
+                "local_correct": bool(outcome.local_correct[0]),
+                "server_at_ms": float(outcome.server_at_ms[0]),
+                "server_correct": bool(outcome.server_correct[0]),
             }
         )
     trace = pd.DataFrame(rows)
@@ -445,11 +742,34 @@ def score(
     device_busy_ms: np.ndarray,
     sent_bytes: np.ndarray,
     deadline_ms: float,
+    *,
+    local_correct: np.ndarray | None = None,
+    server_at_ms: np.ndarray | None = None,
+    server_correct: np.ndarray | None = None,
+    horizon_ms: float = HORIZON_MS,
 ) -> dict[str, float]:
-    """The scoreboard's columns for one run."""
+    """The scoreboard's columns for one run.
+
+    `useful` is what something that acts once gets: a right answer by the
+    deadline. Given the events behind each frame, two more columns say what
+    something that keeps a record gets. `record` is the share whose final
+    answer is right, where the server's answer replaces the device's if it
+    arrives by `horizon_ms`. `corrected` is the share that were not useful at
+    the deadline but were put right before the horizon.
+    """
     on_time = total_ms <= deadline_ms
+    useful = correct & on_time
+    extra = {}
+    if server_at_ms is not None:
+        arrived = server_at_ms <= horizon_ms
+        record = np.where(arrived, server_correct, local_correct)
+        late = (server_at_ms > deadline_ms) & arrived
+        extra = {
+            "record": float(record.mean()),
+            "corrected": float((~useful & late & server_correct).mean()),
+        }
     return {
-        "useful": float((correct & on_time).mean()),
+        "useful": float(useful.mean()),
         "accuracy": float(correct.mean()),
         "on_time": float(on_time.mean()),
         "mean_ms": float(total_ms.mean()),
@@ -457,15 +777,26 @@ def score(
         "device_busy_ms": float(device_busy_ms.mean()),
         "sent_bytes": float(sent_bytes.mean()),
         "sent_share": float((sent_bytes > 0).mean()),
+        **extra,
     }
 
 
-def score_trace(trace: pd.DataFrame, deadline_ms: float) -> dict[str, float]:
+def score_trace(
+    trace: pd.DataFrame, deadline_ms: float, horizon_ms: float = HORIZON_MS
+) -> dict[str, float]:
     """`score` for a trace returned by `simulate`."""
+    events = {}
+    if "server_at_ms" in trace:
+        events = {
+            name: trace[name].to_numpy()
+            for name in ("local_correct", "server_at_ms", "server_correct")
+        }
     return score(
         trace["total_ms"].to_numpy(),
         trace["correct"].to_numpy(),
         trace["device_busy_ms"].to_numpy(),
         trace["sent_bytes"].to_numpy(),
         deadline_ms,
+        horizon_ms=horizon_ms,
+        **events,
     )
