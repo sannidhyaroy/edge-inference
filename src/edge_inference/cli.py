@@ -362,7 +362,7 @@ def cmd_menu_photo_answers(args: argparse.Namespace) -> int:
         resolution = int(resolution or 224)
         sessions = {
             precision: variant_path(directory, name, resolution, precision)
-            for precision in ("float32", "int8")
+            for precision in args.precisions
             if variant_path(directory, name, resolution, precision).exists()
         }
         for photo in args.photos:
@@ -2190,6 +2190,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     menu_photo_answers.add_argument(
         "--photos", type=lambda s: s.split(","), default=["jpeg256q85", "jpeg160q85"]
+    )
+    menu_photo_answers.add_argument(
+        "--precisions", type=lambda s: s.split(","), default=["float32", "int8"]
     )
     menu_photo_answers.add_argument("--payloads", default=str(DATA_DIR / "payloads"))
     menu_photo_answers.add_argument("--threads", type=int, default=2)
