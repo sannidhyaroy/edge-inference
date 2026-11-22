@@ -407,6 +407,68 @@ def cmd_menu_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_menu_scoreboard(args: argparse.Namespace) -> int:
+    """Score every rule and yardstick on one recorded link, for one device setup."""
+    from edge_inference.menu import TEST, TUNE
+    from edge_inference.menu_table import menu_measurements
+    from edge_inference.recorded import RecordedSetup, run_recorded
+    from edge_inference.traces import Trace
+
+    results = Path(args.results)
+
+    def stacked(pattern: str) -> pd.DataFrame:
+        files = sorted(results.glob(pattern))
+        if not files:
+            raise FileNotFoundError(f"no files match {results / pattern}")
+        return pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
+
+    manifest = pd.read_csv(args.manifest)
+    servers = {}
+    for server in args.servers:
+        timing = stacked(f"menu_server_{server}_*.csv.gz")
+        timing = timing[timing["photo"].isin(args.photos)]
+        if args.server_models:
+            timing = timing[timing["model"].isin(args.server_models)]
+        servers[server] = timing
+    payloads = {photo: pd.read_csv(Path(args.payloads) / f"{photo}.csv") for photo in args.photos}
+    table = menu_measurements(
+        manifest[["image", "label"]],
+        stacked("menu_answers_*.csv.gz"),
+        pd.read_csv(results / f"menu_device_{args.config}.csv.gz"),
+        pd.read_csv(results / f"menu_prepare_{args.config}.csv.gz"),
+        stacked("menu_photo_answers_*.csv.gz"),
+        servers,
+        payloads,
+        link=args.link,
+        variants=args.variants or None,
+    )
+    split = manifest.set_index("image").loc[table.images, "split"].to_numpy()
+    tuning, test = table.subset(split == TUNE), table.subset(split == TEST)
+    traces = {
+        label: Trace.from_probe(pd.read_csv(results / f"link_{args.link}_{label}.csv"))
+        for label in (args.tune_label, args.test_label)
+    }
+    console.print(
+        f"{args.config} over {args.link}: {len(table.local)} device variants, "
+        f"{len(table.routes)} photo routes, {len(tuning)} tuning and {len(test)} test images"
+    )
+    for deadline in args.deadlines:
+        setup = RecordedSetup(
+            deadline_ms=deadline, period_ms=args.period, horizon_ms=args.horizon,
+            knowledge=args.knowledge, cancel=args.cancel, seed=args.seed,
+        )  # fmt: skip
+        board = run_recorded(
+            tuning, test, traces[args.tune_label], traces[args.test_label], setup
+        ).assign(config=args.config, servers=",".join(args.servers))
+        out = results / f"menu_scoreboard_{args.config}_{args.link}_{setup.tag()}.csv"
+        board.to_csv(out, index=False)
+        shown = board[["rule", "useful", "record", "device_busy_ms", "sent_share", "plans"]]
+        console.print(f"[bold]{deadline:g} ms[/bold]")
+        console.print(shown.round(4).to_string(index=False, max_colwidth=90))
+        console.print(f"Wrote [bold]{out}[/bold]")
+    return 0
+
+
 def cmd_probe(args: argparse.Namespace) -> int:
     """Record a link to a server over the project's own protocol."""
     from edge_inference.probe import probe
@@ -2236,6 +2298,38 @@ def build_parser() -> argparse.ArgumentParser:
     menu_live.add_argument("--root", default=str(IMAGENETV2_ROOT))
     menu_live.add_argument("--dir", default=str(MENU_DIR))
     menu_live.set_defaults(func=cmd_menu_live)
+
+    menu_scoreboard = menu_sub.add_parser(
+        "scoreboard", help="score every rule on a recorded link for one device setup"
+    )
+    menu_scoreboard.add_argument("--config", required=True, help="the device setup profiled")
+    menu_scoreboard.add_argument("--link", required=True, help="the recorded link's name")
+    menu_scoreboard.add_argument(
+        "--servers", type=lambda s: s.split(","), required=True, help="servers over this link"
+    )
+    menu_scoreboard.add_argument(
+        "--deadlines", type=lambda s: [float(v) for v in s.split(",")], default=[50.0, 100.0]
+    )
+    menu_scoreboard.add_argument(
+        "--photos", type=lambda s: s.split(","), default=["jpeg256q85", "jpeg160q85"]
+    )
+    menu_scoreboard.add_argument(
+        "--variants", type=lambda s: s.split(","), default=[], help="device variants; all if empty"
+    )
+    menu_scoreboard.add_argument(
+        "--server-models", type=lambda s: s.split(","), default=[], help="all if empty"
+    )
+    menu_scoreboard.add_argument("--tune-label", default="tune")
+    menu_scoreboard.add_argument("--test-label", default="test")
+    menu_scoreboard.add_argument("--period", type=float, default=100.0, help="ms between frames")
+    menu_scoreboard.add_argument("--horizon", type=float, default=HORIZON_MS)
+    menu_scoreboard.add_argument("--knowledge", default="exact")
+    menu_scoreboard.add_argument("--cancel", default=NEVER, choices=[NEVER, AT_EXIT, AT_ONCE])
+    menu_scoreboard.add_argument("--seed", type=int, default=SEED)
+    menu_scoreboard.add_argument("--manifest", default=str(MENU_MANIFEST))
+    menu_scoreboard.add_argument("--payloads", default=str(DATA_DIR / "payloads"))
+    menu_scoreboard.add_argument("--results", default=str(RESULTS_DIR))
+    menu_scoreboard.set_defaults(func=cmd_menu_scoreboard)
 
     probe_parser = subparsers.add_parser(
         "probe", help="record a link to a server over the project's protocol"

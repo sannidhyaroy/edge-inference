@@ -27,6 +27,9 @@ DEVICE_SIDE = (
     "probe",
     "device",
     "signals",
+    "traces",
+    "menu_table",
+    "recorded",
 )
 
 
