@@ -112,11 +112,17 @@ def _best_record_per_frame(scenario: Scenario) -> dict[str, np.ndarray]:
 
 
 def ladder_runs(
-    scenario: Scenario, thresholds: Sequence[float] = THRESHOLDS, *, hedge: bool = False
+    scenario: Scenario,
+    thresholds: Sequence[float] = THRESHOLDS,
+    *,
+    hedge: bool = False,
+    cascade: bool = False,
 ) -> list[tuple[str, str, dict[str, np.ndarray]]]:
     """The yardsticks, weakest first: a name, what was chosen, and the run per frame.
 
-    With `hedge`, rung 3h and the record rung 4r join the four.
+    With `hedge`, rung 3h and the record rung 4r join the four. With `cascade`,
+    rungs 3 and 3h also search the plans that send the photo when the final
+    exit is unsure, so they bound rules that play them.
     """
     whole_run = np.zeros(len(scenario.frames), dtype=int)
     table = scenario.measurements
@@ -129,7 +135,7 @@ def ladder_runs(
     (plan,), fixed = _best_per_group(scenario, fixed_plans(table), whole_run)
     per_state, by_network = _best_per_group(scenario, fixed_plans(table), scenario.states)
     family, by_confidence = _best_per_group(
-        scenario, plan_family(table, thresholds), scenario.states
+        scenario, plan_family(table, thresholds, cascade=cascade), scenario.states
     )
     runs = [
         ("1. best fixed option", plan.describe(), fixed),
@@ -138,7 +144,7 @@ def ladder_runs(
     ]
     if hedge:
         hedged, by_hedge = _best_per_group(
-            scenario, plan_family(table, thresholds, hedge=True), scenario.states
+            scenario, plan_family(table, thresholds, hedge=True, cascade=cascade), scenario.states
         )
         runs.append(("3h. best plan per network, hedges included", named(hedged), by_hedge))
     runs.append(("4. best possible per frame", "chosen per frame", _best_per_frame(scenario)))

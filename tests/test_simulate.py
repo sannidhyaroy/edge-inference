@@ -116,11 +116,25 @@ def test_plans_the_profiles_cannot_answer_are_refused():
         run(Plan("int8", 0, (0.5,), FEATURES))
     with pytest.raises(ValueError):
         run(Plan("float32", FINAL + 1))
-    # The final exit always answers, and a hedge needs a local answer.
+    # There is no feature map after the final exit, and a hedge needs a local answer.
     with pytest.raises(ValueError):
-        Plan("float32", None, (), PHOTO)
+        Plan("float32", None, (), FEATURES)
     with pytest.raises(ValueError):
         Plan(hedge=True)
+
+
+def test_a_cascade_answers_when_the_final_exit_is_sure_and_sends_the_photo_otherwise():
+    # Only image 3 is below 0.85 at the final exit: it is sent after the 6 ms run,
+    # and the photo takes 15 ms more.
+    outcome = run(Plan("float32", None, (math.inf, math.inf, 0.85), PHOTO))
+    assert outcome.total_ms.tolist() == [6, 6, 6, 21]
+    assert outcome.correct.tolist() == [True] * 4
+    assert outcome.sent_bytes.tolist() == [0, 0, 0, 1000]
+    assert outcome.answered_at.tolist() == [2, 2, 2, -1]
+    assert outcome.local_correct.tolist() == [True, True, True, False]
+    assert Plan("float32", None, (math.inf, math.inf, 0.85), PHOTO).describe() == (
+        "float32 to final exit, stop at 0.85, else send photo"
+    )
 
 
 def test_plans_describe_themselves():

@@ -279,8 +279,8 @@ class Plan:
     means the final exit. On the way it stops and answers at the first exit
     whose confidence reaches that exit's entry in `thresholds`; a missing entry
     means never stop there. At `depth` itself, without enough confidence, it
-    does `otherwise`. The final exit always answers: a network cannot decline
-    to produce an output.
+    does `otherwise`. At the final exit that can only be answering anyway or
+    sending the photo, a cascade: there is no feature map after the last exit.
 
     `route` names the photo route when the table has more than one. A plan
     that `hedge`s sends the photo the moment the frame arrives and runs its
@@ -298,8 +298,8 @@ class Plan:
     def __post_init__(self) -> None:
         if self.depth is not None and self.depth < 0:
             raise ValueError("depth counts exits from zero")
-        if self.otherwise != ANSWER and self.depth is None:
-            raise ValueError("the final exit always answers, so it has nothing to fall back on")
+        if self.otherwise == FEATURES and self.depth is None:
+            raise ValueError("there is no feature map after the final exit to send")
         if self.hedge and (self.precision is None or self.otherwise != ANSWER):
             raise ValueError("a hedge pairs a sent photo with a local answer")
 
@@ -322,7 +322,7 @@ class Plan:
         text = f"{self.precision} to {where}"
         if stops:
             text += f", stop at {'/'.join(stops)}"
-        if not final and self.otherwise == PHOTO:
+        if self.otherwise == PHOTO:
             text += f", else send photo{via}"
         if not final and self.otherwise == FEATURES:
             text += f", else send {self.payload} features"
@@ -412,7 +412,7 @@ def resolve(
     reached = block.confidence[rows, : depth + 1]
     thresholds = np.array((*plan.thresholds, *[math.inf] * (depth + 1))[: depth + 1])
     confident = reached >= thresholds
-    if depth == final or plan.otherwise == ANSWER:
+    if plan.otherwise == ANSWER:
         confident[:, depth] = True
     answers = confident.any(axis=1)
     # argmax on booleans gives the first True; a row with none stops at `depth`.
@@ -645,14 +645,29 @@ class Scenario:
     horizon_ms: float = HORIZON_MS
     # When a hedged local run stops once the server's answer is in.
     cancel: str = NEVER
-    rtt_ms: np.ndarray = field(init=False)
-    uplink_mbps: np.ndarray = field(init=False)
+    # A recorded link gives every frame its own values; `states` then only say
+    # which bin each frame fell in, and `networks` stand for the bins. Without
+    # them, every frame in a state meets that state's network exactly.
+    rtt_ms: np.ndarray | None = None
+    uplink_mbps: np.ndarray | None = None
+    recorded: bool = field(init=False)
 
     def __post_init__(self) -> None:
+        self.recorded = self.rtt_ms is not None
+        if self.recorded:
+            self.rtt_ms = np.asarray(self.rtt_ms, dtype=float)
+            self.uplink_mbps = np.asarray(self.uplink_mbps, dtype=float)
+            return
         self.rtt_ms = np.array([n.rtt_ms for n in self.networks], dtype=float)[self.states]
         self.uplink_mbps = np.array([n.uplink_mbps for n in self.networks], dtype=float)[
             self.states
         ]
+
+    def observed(self, frame: int) -> Network:
+        """The network a rule sees when it looks at `frame`: what was measured there."""
+        if self.recorded:
+            return Network(float(self.rtt_ms[frame]), float(self.uplink_mbps[frame]))
+        return self.networks[self.states[frame]]
 
     def resolve(self, plan: Plan, at: np.ndarray | None = None) -> Outcome:
         """Carry out one plan on every frame, or on the frames at positions `at`."""
@@ -703,7 +718,7 @@ def simulate(
         view = View(
             frame=frame,
             deadline_ms=scenario.deadline_ms,
-            network=None if seen is None else scenario.networks[scenario.states[seen]],
+            network=None if seen is None else scenario.observed(seen),
             network_age=0 if seen is None else frame - seen,
         )
         plan = rule.choose(view)
@@ -783,7 +798,13 @@ def score(
         "accuracy": float(correct.mean()),
         "on_time": float(on_time.mean()),
         "mean_ms": float(total_ms.mean()),
-        "p95_ms": float(np.percentile(total_ms, 95)),
+        # Frames that never got an answer take forever, and interpolating
+        # between two of them is undefined: then the value at or above is taken.
+        "p95_ms": float(
+            np.percentile(total_ms, 95)
+            if np.isfinite(total_ms).all()
+            else np.percentile(total_ms, 95, method="higher")
+        ),
         "device_busy_ms": float(device_busy_ms.mean()),
         "sent_bytes": float(sent_bytes.mean()),
         "sent_share": float((sent_bytes > 0).mean()),

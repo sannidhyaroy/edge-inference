@@ -29,6 +29,7 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from itertools import product
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -45,6 +46,9 @@ from edge_inference.simulate import (
     View,
     resolve,
 )
+
+if TYPE_CHECKING:
+    from edge_inference.traces import Bins
 
 OFFLOAD = Plan()
 
@@ -89,12 +93,18 @@ def fixed_plans(measurements: Measurements) -> list[Plan]:
 
 
 def plan_family(
-    measurements: Measurements, thresholds: Sequence[float] = THRESHOLDS, *, hedge: bool = False
+    measurements: Measurements,
+    thresholds: Sequence[float] = THRESHOLDS,
+    *,
+    hedge: bool = False,
+    cascade: bool = False,
 ) -> list[Plan]:
     """Every fixed plan, and every plan that stops or sends on confidence.
 
     With `hedge`, every plan that ends in a local answer also comes in a hedged
-    form, sending the photo by each route as it starts.
+    form, sending the photo by each route as it starts. With `cascade`, each
+    variant also runs to its final exit and sends the photo when that answer
+    is not confident enough: the one fallback a model without early exits has.
     """
     levels = (*thresholds, math.inf)
     routes = _photo_routes(measurements)
@@ -113,6 +123,14 @@ def plan_family(
                         Plan(variant, depth, checks, FEATURES, payload)
                         for payload in _features_after(measurements, variant, depth)
                     ]
+    if cascade:
+        for variant in measurements.local:
+            unchecked = (math.inf,) * measurements.final(variant)
+            plans += [
+                Plan(variant, None, (*unchecked, level), PHOTO, route=route)
+                for level in thresholds
+                for route in routes
+            ]
     if hedge:
         plans += [
             replace(plan, route=route, hedge=True)
@@ -246,6 +264,9 @@ class Lookup:
     table: dict[tuple[float, float, float], Plan] = field(default_factory=dict)
     prices: tuple[float, float] = (0.0, 0.0)
     cancel: str = NEVER
+    # With network states cut from a recording, the rule plays the plan for the
+    # state the observed network falls in, chosen under that state's network.
+    bins: Bins | None = None
 
     def __post_init__(self) -> None:
         if self.plans is None:
@@ -253,7 +274,12 @@ class Lookup:
 
     def plan_for(self, network: Network, deadline_ms: float) -> Plan:
         """The plan to play under `network`, worked out once and then remembered."""
-        key = (network.rtt_ms, network.uplink_mbps, deadline_ms)
+        if self.bins is not None:
+            state = self.bins.state_of(network)
+            network = self.bins.networks[state]
+            key = (state, deadline_ms)
+        else:
+            key = (network.rtt_ms, network.uplink_mbps, deadline_ms)
         if key not in self.table:
             self.table[key] = best_plan(
                 self.tuning,
