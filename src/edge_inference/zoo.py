@@ -39,6 +39,9 @@ ZOO = {
     "mnv4m": Entry("timm", "mobilenetv4_conv_medium.e500_r224_in1k"),
     "resnet50": Entry("torchvision", "resnet50", "IMAGENET1K_V2"),
     "convnext_t": Entry("torchvision", "convnext_tiny", "IMAGENET1K_V1"),
+    # Pretrained on ImageNet-22k, which predates ImageNetV2's collection, then
+    # tuned on ImageNet-1k. Weights under CC BY-NC 4.0.
+    "convnextv2_b": Entry("timm", "convnextv2_base.fcmae_ft_in22k_in1k"),
 }
 
 
