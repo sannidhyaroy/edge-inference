@@ -110,9 +110,13 @@ def calibration_batches(loader: DataLoader, *, limit: int) -> list[np.ndarray]:
 # percentiles, so a few extreme values do not stretch them, and the first
 # convolution and the classifier stay in float32, where a coarse step costs
 # the most.
+#
+# `no-vnni-minmax` is the same with ranges from the smallest and largest
+# values, for models whose percentile calibration does not fit in memory.
 INT8_RECIPES = {
     "standard": {},
     "no-vnni": {"reduce_range": True, "calibrate_method": "percentile", "keep_ends": True},
+    "no-vnni-minmax": {"reduce_range": True, "calibrate_method": "minmax", "keep_ends": True},
 }
 
 
@@ -184,9 +188,11 @@ def quantize_onnx(
             nodes_to_exclude=excluded,
             # The calibrator keeps every layer's output for every image until it
             # has seen them all; a histogram of a large model then outgrows the
-            # machine's memory. Ranges are worked out every 16 images instead.
+            # machine's memory. Ranges are worked out every 15 images instead:
+            # a chunk size that divides the number of images leaves the last
+            # chunk empty, which ONNX Runtime refuses ("No data is collected").
             extra_options=(
-                {"CalibMaxIntermediateOutputs": 16} if calibrate_method == "percentile" else None
+                {"CalibMaxIntermediateOutputs": 15} if calibrate_method == "percentile" else None
             ),
         )
 

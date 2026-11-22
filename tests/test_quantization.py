@@ -85,3 +85,8 @@ def test_the_no_vnni_recipe_keeps_the_first_convolution_and_the_classifier_in_fl
 
     assert quantized_weights("standard") == {"first": True, "middle": True, "classifier": True}
     assert quantized_weights("no-vnni") == {"first": False, "middle": True, "classifier": False}
+    assert quantized_weights("no-vnni-minmax") == {
+        "first": False,
+        "middle": True,
+        "classifier": False,
+    }
