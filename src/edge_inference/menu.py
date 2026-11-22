@@ -83,6 +83,7 @@ def answers(
     *,
     threads: int,
     batch: int = 32,
+    load=None,
 ) -> pd.DataFrame:
     """What each graph in `sessions` answers for every image in `table`, and how sure it is.
 
@@ -90,12 +91,16 @@ def answers(
     is prepared once. Accuracy does not depend on the thread count or the batch
     size, so this runs as fast as the machine allows. Timing is measured
     separately, one image at a time.
+
+    `load` turns a file under `root` into a frame: by default the stored image,
+    or for a server, the photo a device sent, decoded.
     """
     import onnxruntime as ort
 
     from edge_inference.ort_session import INPUT_NAME, OUTPUT_NAME
     from edge_inference.preprocess import Preprocess, load_frame
 
+    load = load or load_frame
     options = ort.SessionOptions()
     options.intra_op_num_threads = threads
     opened = {
@@ -106,7 +111,7 @@ def answers(
     found = {precision: ([], []) for precision in opened}
     files = table["file"].tolist()
     for start in range(0, len(files), batch):
-        x = np.concatenate([recipe(load_frame(root / f)) for f in files[start : start + batch]])
+        x = np.concatenate([recipe(load(root / f)) for f in files[start : start + batch]])
         for precision, session in opened.items():
             logits = session.run([OUTPUT_NAME], {INPUT_NAME: x})[0].astype(np.float64)
             exponentials = np.exp(logits - logits.max(axis=1, keepdims=True))
@@ -138,6 +143,38 @@ def answer_variant(job: tuple) -> pd.DataFrame:
     recipe = Path(directory) / f"{name}@{resolution}.json"
     found = answers(sessions, recipe, table, Path(root), threads=threads)
     return found.assign(model=name, resolution=resolution)
+
+
+def read_photo(path: Path):
+    """A sent photo as the server sees it: the stored bytes, decoded."""
+    from edge_inference.preprocess import decode_photo
+
+    return decode_photo(Path(path).read_bytes())
+
+
+def answer_photos(job: tuple) -> pd.DataFrame:
+    """`answers` for one server model on one set of sent photos, as a worker's job.
+
+    The photos stand in for frames: each is decoded as the server would, then
+    prepared by the model's own recipe.
+    """
+    directory, name, resolution, sessions, photos, index, threads = job
+    table = index.assign(file=index["image"].astype(str) + ".jpg")
+    recipe = Path(directory) / f"{name}@{resolution}.json"
+    found = answers(sessions, recipe, table, Path(photos), threads=threads, load=read_photo)
+    return found.assign(model=name, resolution=resolution, photo=Path(photos).name)
+
+
+def timing_sample(table: pd.DataFrame, count: int, seed: int = SEED) -> pd.DataFrame:
+    """The test images that timing runs use: the same ones on the device and on servers.
+
+    A graph's run time does not depend on what the image shows, so it is timed
+    on a sample and borrowed for the rest. `count` of 0 keeps every test image.
+    """
+    test = table[table["split"] == TEST].sort_values("image")
+    if count:
+        test = test.sample(n=min(count, len(test)), random_state=seed)
+    return test.sort_values("image")
 
 
 def cpu_settings(cpus: list[int]) -> dict[str, object]:
@@ -212,4 +249,40 @@ def profile_variant(
                 "cpu_mhz": average_mhz(cpus),
             }
         )
+    return pd.DataFrame(rows)
+
+
+def profile_preparation(
+    steps: dict[str, object],
+    images: list[tuple[int, Path]],
+    *,
+    load,
+    clock,
+    cpus: list[int],
+) -> pd.DataFrame:
+    """Time every step on every image: each recipe's resize, crop and scaling, and each photo's encoding.
+
+    Both depend on the stored image's size, unlike a graph's run, so they are
+    timed on every image rather than on a sample. Each image is decoded once,
+    untimed, then handed to each step in turn; the order of the steps rotates
+    from one image to the next, so no step always finds the frame freshly in
+    cache.
+    """
+    keys = list(steps)
+    rows = []
+    for position, (image, path) in enumerate(images):
+        frame = load(path)
+        shift = position % len(keys)
+        for key in keys[shift:] + keys[:shift]:
+            start = clock()
+            steps[key](frame)
+            done = clock()
+            rows.append(
+                {
+                    "image": image,
+                    "step": key,
+                    "ms": (done - start) * 1000.0,
+                    "cpu_mhz": average_mhz(cpus),
+                }
+            )
     return pd.DataFrame(rows)

@@ -348,6 +348,45 @@ def parse_photo(key: str) -> tuple[int, int]:
     return int(shorter), int(quality)
 
 
+def cmd_menu_photo_answers(args: argparse.Namespace) -> int:
+    """Record what each server model answers for every sent photo, per model."""
+    from concurrent.futures import ProcessPoolExecutor
+
+    from edge_inference.menu import answer_photos
+    from edge_inference.zoo import variant_path
+
+    directory, payloads = Path(args.dir), Path(args.payloads)
+    jobs = []
+    for key in args.models:
+        name, _, resolution = key.partition("@")
+        resolution = int(resolution or 224)
+        sessions = {
+            precision: variant_path(directory, name, resolution, precision)
+            for precision in ("float32", "int8")
+            if variant_path(directory, name, resolution, precision).exists()
+        }
+        for photo in args.photos:
+            index = pd.read_csv(payloads / f"{photo}.csv")
+            jobs.append((directory, name, resolution, sessions, payloads / photo, index,
+                         args.threads))  # fmt: skip
+    with ProcessPoolExecutor(args.workers) as pool:
+        found = pd.concat(pool.map(answer_photos, jobs), ignore_index=True)
+    results = Path(args.results)
+    for name, frame in found.groupby("model"):
+        out = results / f"menu_photo_answers_{name}.csv.gz"
+        frame.to_csv(out, index=False)
+        console.print(f"Wrote [bold]{out}[/bold]")
+    summary = (
+        found.groupby(["model", "photo", "precision", "split"])["correct"]
+        .mean()
+        .unstack("split")
+        .mul(100)
+        .round(2)
+    )
+    console.print(summary.to_string())
+    return 0
+
+
 def cmd_menu_serve(args: argparse.Namespace) -> int:
     """Answer photos with the menu's server models until interrupted."""
     from edge_inference.serving import MenuServer, open_model
@@ -428,11 +467,12 @@ def cmd_menu_profile_server(args: argparse.Namespace) -> int:
     import hashlib
     import time
 
+    from edge_inference.menu import timing_sample
     from edge_inference.preprocess import decode_photo
     from edge_inference.serving import answer, open_model
 
     payloads = Path(args.payloads)
-    index = pd.read_csv(payloads.parent / f"{payloads.name}.csv")
+    index = timing_sample(pd.read_csv(payloads.parent / f"{payloads.name}.csv"), args.images)
     directory, results = Path(args.dir), Path(args.results)
     for key in args.models:
         served = open_model(*parse_variant(key, directory), threads=args.threads)
@@ -502,7 +542,7 @@ def cmd_menu_profile_device(args: argparse.Namespace) -> int:
     import time
 
     from edge_inference.energy import counters, measure, summarise
-    from edge_inference.menu import cpu_settings, profile_variant
+    from edge_inference.menu import cpu_settings, profile_variant, timing_sample
     from edge_inference.preprocess import encode_photo, load_frame
     from edge_inference.serving import open_model
 
@@ -511,8 +551,7 @@ def cmd_menu_profile_device(args: argparse.Namespace) -> int:
     if args.cpus:
         os.sched_setaffinity(0, cpus)
     table = pd.read_csv(args.manifest)
-    chosen = table[table["split"] == "test"].sample(n=args.images, random_state=SEED)
-    chosen = chosen.sort_values("image")
+    chosen = timing_sample(table, args.images)
     frames = [(row.image, load_frame(root / row.file)) for row in chosen.itertuples()]
     keys = args.variants or device_variants(directory)
     settings = cpu_settings(cpus)
@@ -579,6 +618,43 @@ def cmd_menu_profile_device(args: argparse.Namespace) -> int:
                 results / f"menu_energy_{args.config}.csv", index=False
             )
     console.print(f"Wrote the {args.config} profiles to [bold]{results}[/bold]")
+    return 0
+
+
+def cmd_menu_profile_prepare(args: argparse.Namespace) -> int:
+    """Time each device recipe's preparation, and each photo's encoding, on every image."""
+    import functools
+    import time
+
+    from edge_inference.menu import cpu_settings, profile_preparation
+    from edge_inference.preprocess import Preprocess, encode_photo, load_frame
+
+    directory, root, results = Path(args.dir), Path(args.root), Path(args.results)
+    cpus = [int(c) for c in args.cpus.split(",")] if args.cpus else sorted(os.sched_getaffinity(0))
+    if args.cpus:
+        os.sched_setaffinity(0, cpus)
+    table = pd.read_csv(args.manifest)
+    if args.split:
+        table = table[table["split"] == args.split]
+    images = [(row.image, root / row.file) for row in table.sort_values("image").itertuples()]
+    steps = {
+        path.stem: Preprocess.load(path)
+        for path in sorted(directory.glob("*@*.json"))
+        if path.stem.partition("@")[0] in DEVICE_MODELS
+    }
+    for photo in args.photos:
+        shorter, quality = parse_photo(photo)
+        steps[photo] = functools.partial(encode_photo, shorter_side=shorter, quality=quality)
+    console.print(f"{args.config}: {len(steps)} steps on {len(images)} images, cores {cpus}")
+    cool_down(args.cool_to)
+    rows = profile_preparation(steps, images, load=load_frame, clock=time.perf_counter, cpus=cpus)
+    labels = {"config": args.config, **cpu_settings(cpus), "machine": machine_model(),
+              "cpu": cpu_model(), "power_source": power_source()}  # fmt: skip
+    out = results / f"menu_prepare_{args.config}.csv.gz"
+    rows.assign(**labels).to_csv(out, index=False)
+    medians = rows.groupby("step")["ms"].median().round(2)
+    console.print(medians.to_string())
+    console.print(f"Wrote [bold]{out}[/bold]")
     return 0
 
 
@@ -2044,6 +2120,24 @@ def build_parser() -> argparse.ArgumentParser:
     menu_answers.add_argument("--results", default=str(RESULTS_DIR))
     menu_answers.set_defaults(func=cmd_menu_answers)
 
+    menu_photo_answers = menu_sub.add_parser(
+        "photo-answers", help="what every server model answers for every sent photo"
+    )
+    menu_photo_answers.add_argument(
+        "--models", type=lambda s: s.split(","), required=True, help="model or model@resolution"
+    )
+    menu_photo_answers.add_argument(
+        "--photos", type=lambda s: s.split(","), default=["jpeg256q85", "jpeg160q85"]
+    )
+    menu_photo_answers.add_argument("--payloads", default=str(DATA_DIR / "payloads"))
+    menu_photo_answers.add_argument("--threads", type=int, default=2)
+    menu_photo_answers.add_argument(
+        "--workers", type=int, default=max(1, (os.cpu_count() or 2) // 2)
+    )
+    menu_photo_answers.add_argument("--dir", default=str(MENU_DIR))
+    menu_photo_answers.add_argument("--results", default=str(RESULTS_DIR))
+    menu_photo_answers.set_defaults(func=cmd_menu_photo_answers)
+
     menu_serve = menu_sub.add_parser("serve", help="answer photos with the menu's server models")
     menu_serve.add_argument(
         "--models", type=lambda s: s.split(","), required=True,
@@ -2070,6 +2164,9 @@ def build_parser() -> argparse.ArgumentParser:
     menu_profile_server.add_argument("--models", type=lambda s: s.split(","), required=True)
     menu_profile_server.add_argument("--server", required=True, help="a name for this server")
     menu_profile_server.add_argument("--threads", type=int, default=6)
+    menu_profile_server.add_argument(
+        "--images", type=int, default=1000, help="test photos to time; 0 for all"
+    )
     menu_profile_server.add_argument("--warmup", type=int, default=20)
     menu_profile_server.add_argument("--cool-to", type=float, default=None)
     menu_profile_server.add_argument("--dir", default=str(MENU_DIR))
@@ -2097,6 +2194,22 @@ def build_parser() -> argparse.ArgumentParser:
     menu_profile_device.add_argument("--dir", default=str(MENU_DIR))
     menu_profile_device.add_argument("--results", default=str(RESULTS_DIR))
     menu_profile_device.set_defaults(func=cmd_menu_profile_device)
+
+    menu_profile_prepare = menu_sub.add_parser(
+        "profile-prepare", help="time each device recipe's preparation on every image"
+    )
+    menu_profile_prepare.add_argument("--config", required=True, help="a name for this setup")
+    menu_profile_prepare.add_argument("--cpus", default="", help="cores to pin to, e.g. 2,4")
+    menu_profile_prepare.add_argument("--split", default="", help="tune or test; empty for all")
+    menu_profile_prepare.add_argument(
+        "--photos", type=lambda s: s.split(","), default=["jpeg256q85", "jpeg160q85"]
+    )
+    menu_profile_prepare.add_argument("--cool-to", type=float, default=None)
+    menu_profile_prepare.add_argument("--manifest", default=str(MENU_MANIFEST))
+    menu_profile_prepare.add_argument("--root", default=str(IMAGENETV2_ROOT))
+    menu_profile_prepare.add_argument("--dir", default=str(MENU_DIR))
+    menu_profile_prepare.add_argument("--results", default=str(RESULTS_DIR))
+    menu_profile_prepare.set_defaults(func=cmd_menu_profile_prepare)
 
     menu_live = menu_sub.add_parser("live", help="carry plans out against a menu server")
     menu_live.add_argument("--server", required=True, help="host:port")
