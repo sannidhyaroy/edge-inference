@@ -29,7 +29,13 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
-from onnxruntime.quantization import CalibrationDataReader, QuantType, quantize_static
+import onnx
+from onnxruntime.quantization import (
+    CalibrationDataReader,
+    CalibrationMethod,
+    QuantType,
+    quantize_static,
+)
 from onnxruntime.quantization.shape_inference import quant_pre_process
 from torch.utils.data import DataLoader
 
@@ -92,12 +98,41 @@ def calibration_batches(loader: DataLoader, *, limit: int) -> list[np.ndarray]:
     return batches
 
 
+# Named settings for `quantize_onnx`.
+#
+# `standard` is ONNX Runtime's default static recipe: activations unsigned,
+# weights signed, ranges from the smallest and largest values seen.
+#
+# `no-vnni` is for x86 processors without VNNI instructions, such as Zen 3.
+# There the unsigned-by-signed 8-bit multiply can overflow, which ONNX
+# Runtime's documentation names as a cause of accuracy loss: weights are kept
+# to 7 bits (`reduce_range`). Ranges come from the 0.001st to 99.999th
+# percentiles, so a few extreme values do not stretch them, and the first
+# convolution and the classifier stay in float32, where a coarse step costs
+# the most.
+INT8_RECIPES = {
+    "standard": {},
+    "no-vnni": {"reduce_range": True, "calibrate_method": "percentile", "keep_ends": True},
+}
+
+
+def ends(model: onnx.ModelProto) -> list[str]:
+    """The first convolution and the last matrix product: where a network meets its input and output."""
+    nodes = model.graph.node
+    first = next(n.name for n in nodes if n.op_type == "Conv")
+    last = next(n.name for n in reversed(nodes) if n.op_type in ("Gemm", "MatMul"))
+    return [first, last]
+
+
 def quantize_onnx(
     source: Path,
     destination: Path,
     calibration: CalibrationDataReader,
     *,
     per_channel: bool = True,
+    reduce_range: bool = False,
+    calibrate_method: str = "minmax",
+    keep_ends: bool = False,
 ) -> Path:
     """Quantize an ONNX model to INT8 and return the written path.
 
@@ -133,14 +168,26 @@ def quantize_onnx(
         # optimisation, are what quantization actually needs, and the batch
         # axis stays dynamic either way.
         quant_pre_process(str(source), str(prepared), skip_symbolic_shape=True)
-
+        excluded = ends(onnx.load(str(prepared), load_external_data=False)) if keep_ends else None
         quantize_static(
             str(prepared),
             str(destination),
             calibration,
             per_channel=per_channel,
+            reduce_range=reduce_range,
             weight_type=QuantType.QInt8,
             activation_type=QuantType.QUInt8,
+            calibrate_method={
+                "minmax": CalibrationMethod.MinMax,
+                "percentile": CalibrationMethod.Percentile,
+            }[calibrate_method],
+            nodes_to_exclude=excluded,
+            # The calibrator keeps every layer's output for every image until it
+            # has seen them all; a histogram of a large model then outgrows the
+            # machine's memory. Ranges are worked out every 16 images instead.
+            extra_options=(
+                {"CalibMaxIntermediateOutputs": 16} if calibrate_method == "percentile" else None
+            ),
         )
 
     return destination

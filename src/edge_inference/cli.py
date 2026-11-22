@@ -70,6 +70,7 @@ from edge_inference.offload import (
 from edge_inference.policies import OFFLOAD, Always, Lookup
 from edge_inference.profiling import operations_per_exit, profile_model
 from edge_inference.quantization import (
+    INT8_RECIPES,
     DataLoaderCalibrationReader,
     calibration_batches,
     quantize_exit_stages,
@@ -283,8 +284,9 @@ def cmd_menu_export(args: argparse.Namespace) -> int:
         model = build(name)
         for resolution in args.resolutions:
             paths = export_variant(
-                name, resolution, Path(args.out), calibration=calibration, model=model
-            )
+                name, resolution, Path(args.out), calibration=calibration, model=model,
+                int8_recipe=args.int8_recipe, requantize=args.requantize,
+            )  # fmt: skip
             console.print(f"{name}@{resolution}: " + ", ".join(p.name for p in paths.values()))
     return 0
 
@@ -2194,6 +2196,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--resolutions", type=lambda s: [int(v) for v in s.split(",")], default=[224]
     )
     menu_export.add_argument("--calibration-images", type=int, default=256)
+    menu_export.add_argument("--int8-recipe", default="standard", choices=sorted(INT8_RECIPES))
+    menu_export.add_argument(
+        "--requantize", action="store_true", help="make the INT8 copy again even if present"
+    )
     menu_export.add_argument("--manifest", default=str(MENU_MANIFEST))
     menu_export.add_argument("--root", default=str(IMAGENETV2_ROOT))
     menu_export.add_argument("--out", default=str(MENU_DIR))

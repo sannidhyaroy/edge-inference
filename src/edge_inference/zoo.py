@@ -20,7 +20,7 @@ from torch import nn
 
 from edge_inference.export import export_onnx
 from edge_inference.preprocess import Preprocess, load_frame
-from edge_inference.quantization import ArrayCalibrationReader, quantize_onnx
+from edge_inference.quantization import INT8_RECIPES, ArrayCalibrationReader, quantize_onnx
 
 
 @dataclass(frozen=True)
@@ -123,10 +123,13 @@ def export_variant(
     *,
     calibration: Sequence[Path] = (),
     model: nn.Module | None = None,
+    int8_recipe: str = "standard",
+    requantize: bool = False,
 ) -> dict[str, Path]:
     """Export `name` at `resolution`, its recipe, and an INT8 copy if calibration images are given.
 
-    Files already present are kept, so an interrupted run resumes.
+    Files already present are kept, so an interrupted run resumes; with
+    `requantize` the INT8 copy is made again, by `int8_recipe`.
     """
     prepare = recipe(name).at(resolution)
     directory.mkdir(parents=True, exist_ok=True)
@@ -139,7 +142,12 @@ def export_variant(
         )
     if calibration:
         paths["int8"] = variant_path(directory, name, resolution, "int8")
-        if not paths["int8"].exists():
+        if requantize or not paths["int8"].exists():
             batches = [prepare(load_frame(path)) for path in calibration]
-            quantize_onnx(paths["float32"], paths["int8"], ArrayCalibrationReader(batches))
+            quantize_onnx(
+                paths["float32"],
+                paths["int8"],
+                ArrayCalibrationReader(batches),
+                **INT8_RECIPES[int8_recipe],
+            )
     return paths
