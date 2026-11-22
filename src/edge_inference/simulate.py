@@ -251,6 +251,13 @@ class Measurements:
             server=server,
         )
 
+    def with_local(self, extra: Mapping[str, Local]) -> Measurements:
+        """The same table with more device variants, such as the network at other input sizes."""
+        clash = set(extra) & set(self.local)
+        if clash:
+            raise ValueError(f"variants already in the table: {sorted(clash)}")
+        return Measurements(self.images, self.labels, {**self.local, **extra}, self.routes)
+
     def subset(self, rows: np.ndarray) -> Measurements:
         """The same table restricted to `rows`, a boolean mask or an index array."""
 
@@ -268,6 +275,30 @@ class Measurements:
             {key: take(block) for key, block in self.local.items()},
             {key: take(route) for key, route in self.routes.items()},
         )
+
+
+def local_from_profile(profile: pd.DataFrame, images: np.ndarray) -> Local:
+    """A device variant from an exit profile, one row per image and exit, in the order of `images`.
+
+    Rows are matched by image, and every image must have every exit exactly once.
+    """
+    names = tuple(profile.sort_values("exit")["exit_name"].unique())
+
+    def wide(value: str) -> np.ndarray:
+        table = profile.pivot(index="image", columns="exit_name", values=value)
+        missing = np.setdiff1d(images, table.index.to_numpy())
+        if len(missing) or table[list(names)].isna().any().any():
+            raise ValueError(f"the profile lacks {value} for some images or exits")
+        return table.loc[images, list(names)].to_numpy()
+
+    if profile.duplicated(["image", "exit"]).any():
+        raise ValueError("an image appears twice at one exit")
+    return Local(
+        wide("cumulative_ms").astype(float),
+        wide("confidence").astype(float),
+        wide("correct").astype(bool),
+        names,
+    )
 
 
 @dataclass(frozen=True)

@@ -146,3 +146,16 @@ def test_shared_pool_stages_chain_and_refuse_a_second_size(tmp_path):
         check=False,
     )
     assert result.returncode == 0, result.stderr[-2000:]
+
+
+def test_stage_graphs_at_another_size_get_their_own_names_and_the_trained_size_keeps_its_own():
+    from pathlib import Path
+
+    from edge_inference.config import IMAGE_SIZE
+    from edge_inference.export import sized_base, stage_paths
+
+    checkpoint = Path("checkpoints/model.pt")
+    assert sized_base(checkpoint) == Path("checkpoints/model")
+    assert sized_base(checkpoint, IMAGE_SIZE) == Path("checkpoints/model")
+    assert sized_base(checkpoint, 96) == Path("checkpoints/model@96")
+    assert stage_paths(sized_base(checkpoint, 96))[0].name == "model@96.stage1.onnx"

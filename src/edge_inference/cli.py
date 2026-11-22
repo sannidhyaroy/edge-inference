@@ -48,6 +48,7 @@ from edge_inference.export import (
     evaluate_stages,
     export_exit_stages,
     export_onnx,
+    sized_base,
     stage_paths,
     verify_parity,
     verify_stage_parity,
@@ -95,6 +96,7 @@ from edge_inference.simulate import (
     Measurements,
     Plan,
     Scenario,
+    local_from_profile,
     simulate,
     split_images,
 )
@@ -1096,8 +1098,8 @@ def cmd_exits_profile(args: argparse.Namespace) -> int:
         return 1
     load_checkpoint(model, checkpoint)
 
-    dataset = load_split("val", root=Path(args.root))
-    macs = operations_per_exit(model, image_size=IMAGE_SIZE)
+    dataset = load_split("val", root=Path(args.root), image_size=args.image_size)
+    macs = operations_per_exit(model, image_size=args.image_size)
     count = len(dataset) if args.limit is None else min(args.limit, len(dataset))
 
     if args.runtime == "pytorch" and args.precision != "float32":
@@ -1120,7 +1122,7 @@ def cmd_exits_profile(args: argparse.Namespace) -> int:
         )
     else:
         suffix = ".onnx" if args.precision == "float32" else f".{args.precision}.onnx"
-        paths = stage_paths(checkpoint.with_suffix(""), suffix=suffix)
+        paths = stage_paths(sized_base(checkpoint, args.image_size), suffix=suffix)
         missing = [path for path in paths if not path.exists()]
         if missing:
             command = "export" if args.precision == "float32" else "quantize"
@@ -1169,7 +1171,8 @@ def cmd_exits_profile(args: argparse.Namespace) -> int:
     # are committed rather than regenerated. Compression cuts them about 5x,
     # and pandas reads .csv.gz directly.
     default_name = (
-        f"exit_profile_{checkpoint.stem}_{args.runtime}_{args.precision}_t{args.threads}.csv.gz"
+        f"exit_profile_{sized_base(checkpoint, args.image_size).name}_{args.runtime}"
+        f"_{args.precision}_t{args.threads}.csv.gz"
     )
     out = Path(args.out or RESULTS_DIR / default_name)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -1193,9 +1196,8 @@ def cmd_exits_export(args: argparse.Namespace) -> int:
     load_checkpoint(model, checkpoint)
 
     # Stage graphs sit beside the checkpoint they came from, named after it.
-    paths = export_exit_stages(
-        model, checkpoint.with_suffix(""), image_size=args.image_size, opset=args.opset
-    )
+    base = sized_base(checkpoint, args.image_size)
+    paths = export_exit_stages(model, base, image_size=args.image_size, opset=args.opset)
     for path in paths:
         console.print(f"Exported [bold]{path}[/bold] ({path.stat().st_size / 2**20:.2f} MiB)")
 
@@ -1221,7 +1223,7 @@ def cmd_exits_export(args: argparse.Namespace) -> int:
         row["opset"] = args.opset
         row["onnx_mib"] = path.stat().st_size / 2**20
 
-    results = Path(args.results or RESULTS_DIR / f"onnx_parity_{checkpoint.stem}.csv")
+    results = Path(args.results or RESULTS_DIR / f"onnx_parity_{base.name}.csv")
     results.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(results, index=False)
     console.print(f"Wrote [bold]{results}[/bold]")
@@ -1247,7 +1249,7 @@ def cmd_exits_quantize(args: argparse.Namespace) -> int:
     """Quantize each stage of an early-exit model and compare every exit."""
     seed_everything()
 
-    base = Path(args.checkpoint).with_suffix("")
+    base = sized_base(Path(args.checkpoint), args.image_size)
     sources = stage_paths(base)
     missing = [path for path in sources if not path.exists()]
     if missing:
@@ -1257,7 +1259,9 @@ def cmd_exits_quantize(args: argparse.Namespace) -> int:
         return 1
 
     # Training images with evaluation preprocessing, as for the plain model.
-    calibration_dataset = load_split("train", root=Path(args.root), augment=False)
+    calibration_dataset = load_split(
+        "train", root=Path(args.root), augment=False, image_size=args.image_size
+    )
     calibration_loader = build_dataloader(
         calibration_dataset, batch_size=args.batch_size, shuffle=True
     )
@@ -1274,7 +1278,7 @@ def cmd_exits_quantize(args: argparse.Namespace) -> int:
         per_channel=not args.per_tensor,
     )
 
-    val_dataset = load_split("val", root=Path(args.root))
+    val_dataset = load_split("val", root=Path(args.root), image_size=args.image_size)
     val_loader = build_dataloader(val_dataset, batch_size=args.batch_size, shuffle=False)
 
     rows = []
@@ -1649,7 +1653,8 @@ def cmd_decide_evaluate(args: argparse.Namespace) -> int:
         seed=args.seed,
         **hedge_settings(args),
     )
-    result = run_setup(Measurements.from_components(components, args.server), setup)
+    table = Measurements.from_components(components, args.server)
+    result = run_setup(with_sizes(table, results, stem, args.threads, args.sizes), setup)
     board, scenario = result.board, result.scenario
     if not result.held_out:
         console.print(
@@ -1693,7 +1698,7 @@ def cmd_decide_evaluate(args: argparse.Namespace) -> int:
     decide_us = board.loc[board["rule"] == OURS, "decide_us"].iloc[0]
     console.print(f"  {OURS} takes {decide_us:.2f} microseconds to decide on a frame")
 
-    tag = f"{stem}_{setup.tag()}"
+    tag = f"{stem}_{setup.tag()}{sizes_tag(args.sizes)}"
     outputs = {
         f"decide_scoreboard_{tag}.csv": board,
         f"decide_trace_{tag}.csv.gz": result.traces,
@@ -1727,7 +1732,9 @@ def cmd_decide_sweep(args: argparse.Namespace) -> int:
     )
     setups = grid(base, slowdowns=args.slowdowns, deadlines=args.deadlines, seeds=args.seeds)
     console.print(f"Scoring {len(setups)} setups on {args.workers} processes")
-    boards = run_sweep(Measurements.from_components(components, args.server), setups, args.workers)
+    table = Measurements.from_components(components, args.server)
+    table = with_sizes(table, results, stem, args.threads, args.sizes)
+    boards = run_sweep(table, setups, args.workers)
 
     # Mean over seeds of the useful share, per device speed and deadline.
     shown = {
@@ -1773,7 +1780,7 @@ def cmd_decide_sweep(args: argparse.Namespace) -> int:
         tag += f"_stay{args.stay:g}"
     if args.knowledge != "exact":
         tag += f"_{args.knowledge.replace(':', '')}"
-    tag += base.extras()
+    tag += base.extras() + sizes_tag(args.sizes)
     out = results / f"decide_sweep_{tag}.csv"
     boards.to_csv(out, index=False)
     console.print(f"Wrote [bold]{out}[/bold] ({len(boards)} rows)")
@@ -2078,6 +2085,31 @@ def cmd_bench(args: argparse.Namespace) -> int:
         )
 
     return 0
+
+
+def add_size_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--sizes",
+        type=lambda s: [int(v) for v in s.split(",")],
+        default=[],
+        help="also offer the network at these input sizes, from their exit profiles",
+    )
+
+
+def sizes_tag(sizes) -> str:
+    """A file-name part for runs that add input sizes, so they never replace runs without."""
+    return f"_sizes{'-'.join(map(str, sizes))}" if sizes else ""
+
+
+def with_sizes(table: Measurements, results: Path, stem: str, threads: int, sizes) -> Measurements:
+    """`table` with a variant per precision and extra input size, named like `int8@96`."""
+    extra = {}
+    for size in sizes:
+        for precision in ("float32", "int8"):
+            name = f"exit_profile_{stem}@{size}_onnxruntime_{precision}_t{threads}.csv.gz"
+            profile = pd.read_csv(results / name)
+            extra[f"{precision}@{size}"] = local_from_profile(profile, table.images)
+    return table.with_local(extra)
 
 
 def add_hedge_arguments(parser: argparse.ArgumentParser) -> None:
@@ -2459,6 +2491,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="int8 needs `--runtime onnxruntime` and `edge exits quantize`",
     )
     exits_profile.add_argument("--threads", type=int, default=2, help="pinned thread count")
+    exits_profile.add_argument(
+        "--image-size", type=int, default=IMAGE_SIZE, help="input size; stage graphs must match"
+    )
     exits_profile.add_argument("--warmup", type=int, default=10, help="discarded runs first")
     exits_profile.add_argument(
         "--cool-to",
@@ -2516,6 +2551,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="one scale per layer instead of per convolution filter, usually less accurate",
     )
     exits_quantize.add_argument("--batch-size", type=int, default=32)
+    exits_quantize.add_argument("--image-size", type=int, default=IMAGE_SIZE)
     exits_quantize.add_argument("--threads", type=int, default=6, help="threads for evaluation")
     exits_quantize.add_argument(
         "--results", default=None, help="accuracy CSV (default names the checkpoint)"
@@ -2712,6 +2748,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     decide_evaluate.add_argument("--seed", type=int, default=SEED)
     add_hedge_arguments(decide_evaluate)
+    add_size_argument(decide_evaluate)
     decide_evaluate.set_defaults(func=cmd_decide_evaluate)
 
     decide_sweep = decide_sub.add_parser(
@@ -2751,6 +2788,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="setups scored at once (default: half the logical cores)",
     )
     add_hedge_arguments(decide_sweep)
+    add_size_argument(decide_sweep)
     decide_sweep.set_defaults(func=cmd_decide_sweep)
 
     serve_parser = subparsers.add_parser(

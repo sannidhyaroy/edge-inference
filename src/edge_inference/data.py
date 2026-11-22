@@ -27,8 +27,8 @@ from edge_inference.config import (
 EVAL_RESIZE_RATIO = 1.14
 
 
-def build_transforms(*, train: bool) -> v2.Compose:
-    """Build the preprocessing pipeline for one split.
+def build_transforms(*, train: bool, image_size: int = IMAGE_SIZE) -> v2.Compose:
+    """Build the preprocessing pipeline for one split, at `image_size` pixels square.
 
     Training and evaluation deliberately differ. Training applies random crops
     and horizontal flips, which is data augmentation: showing the network a
@@ -39,13 +39,13 @@ def build_transforms(*, train: bool) -> v2.Compose:
     """
     if train:
         stages: list[v2.Transform] = [
-            v2.RandomResizedCrop(IMAGE_SIZE, antialias=True),
+            v2.RandomResizedCrop(image_size, antialias=True),
             v2.RandomHorizontalFlip(),
         ]
     else:
         stages = [
-            v2.Resize(int(IMAGE_SIZE * EVAL_RESIZE_RATIO), antialias=True),
-            v2.CenterCrop(IMAGE_SIZE),
+            v2.Resize(int(image_size * EVAL_RESIZE_RATIO), antialias=True),
+            v2.CenterCrop(image_size),
         ]
 
     return v2.Compose(
@@ -67,6 +67,7 @@ def load_split(
     root: Path = DATA_DIR,
     download: bool = False,
     augment: bool | None = None,
+    image_size: int = IMAGE_SIZE,
 ) -> Imagenette:
     """Load one Imagenette split, downloading it first if asked.
 
@@ -81,7 +82,9 @@ def load_split(
     would measure a distribution that never occurs at inference time.
     """
     root.mkdir(parents=True, exist_ok=True)
-    transform = build_transforms(train=split == "train" if augment is None else augment)
+    transform = build_transforms(
+        train=split == "train" if augment is None else augment, image_size=image_size
+    )
 
     try:
         return Imagenette(

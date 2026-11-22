@@ -145,6 +145,15 @@ class ExitStage(nn.Module):
         return features, logits
 
 
+def sized_base(checkpoint: Path, image_size: int = IMAGE_SIZE) -> Path:
+    """The name a checkpoint's stage graphs share, marked with the input size if not the trained one.
+
+    The trained size keeps the plain name, so existing graphs and profiles keep theirs.
+    """
+    base = checkpoint.with_suffix("")
+    return base if image_size == IMAGE_SIZE else base.with_name(f"{base.name}@{image_size}")
+
+
 def stage_paths(base: Path, *, suffix: str = ".onnx") -> list[Path]:
     """Where each stage graph of the model at `base` (no suffix) is written.
 

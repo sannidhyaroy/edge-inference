@@ -252,3 +252,32 @@ def test_the_trace_scores_correct_and_in_time():
     assert scores["useful"] == 0.5
     assert scores["accuracy"] == 1.0
     assert scores["sent_share"] == 1.0
+
+
+def test_a_profile_at_another_size_becomes_a_variant_matched_by_image():
+    import pandas as pd
+
+    from edge_inference.simulate import local_from_profile
+
+    table = measurements()
+    rows = [
+        {"image": image, "exit": exit + 1, "exit_name": name, "cumulative_ms": 10.0 * (exit + 1),
+         "confidence": 0.5, "correct": image % 2 == 0}
+        for image in reversed(table.images)
+        for exit, name in enumerate(("exit1", "exit2", "final"))
+    ]  # fmt: skip
+    profile = pd.DataFrame(rows)
+    block = local_from_profile(profile, table.images)
+    assert block.exit_names == ("exit1", "exit2", "final")
+    assert block.ms.tolist() == [[10.0, 20.0, 30.0]] * len(table.images)
+    assert block.correct[:, 0].tolist() == [image % 2 == 0 for image in table.images]
+
+    wider = table.with_local({"int8@96": block})
+    assert set(wider.local) == {"float32", "int8", "int8@96"}
+    assert Plan("int8@96").describe() == "int8@96 to final exit"
+    with pytest.raises(ValueError):
+        wider.with_local({"int8@96": block})
+    with pytest.raises(ValueError):
+        local_from_profile(profile.iloc[1:], table.images)
+    with pytest.raises(ValueError):
+        local_from_profile(pd.concat([profile, profile.iloc[:1]]), table.images)
