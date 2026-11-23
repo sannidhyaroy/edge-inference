@@ -473,4 +473,7 @@ papers/*
 #   scoreboard, which is what stays tracked.
 results/decide_trace_*.csv.gz
 
+# Session logs and rehearsal outputs; some name machines and addresses.
+logs/
+
 ### End of project-specific ###
