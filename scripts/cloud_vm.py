@@ -106,7 +106,8 @@ def setup() -> None:
 
     data = ROOT / "data" / "imagenetv2"
     data.mkdir(parents=True, exist_ok=True)
-    run(f"curl -fsSL {IMAGENETV2} | tar -xz -C {data}")
+    # Named .tar.gz, but a plain tar inside.
+    run(f"curl -fsSL {IMAGENETV2} | tar -x -C {data}")
     run(f"{UV} run edge menu payloads --photos {','.join(PHOTOS)} --split test")
     check_photos()
 
