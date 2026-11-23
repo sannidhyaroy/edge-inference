@@ -248,6 +248,7 @@ def cmd_data_origin(args: argparse.Namespace) -> int:
 
 IMAGENETV2_ROOT = DATA_DIR / "imagenetv2" / "imagenetv2-matched-frequency-format-val"
 MENU_DIR = CHECKPOINT_DIR / "menu"
+ONNXRUNTIME, TORCH_CUDA = "onnxruntime", "torch-cuda"
 MENU_MANIFEST = Path("manifests/imagenetv2_mf.csv")
 
 
@@ -391,18 +392,43 @@ def cmd_menu_photo_answers(args: argparse.Namespace) -> int:
     return 0
 
 
+def open_server_model(key: str, directory: Path, *, threads: int, backend: str):
+    """A server model from its ONNX graph on the CPU, or from its weights in PyTorch on CUDA."""
+    if backend == TORCH_CUDA:
+        from edge_inference.serving_torch import open_torch_model
+
+        return open_torch_model(key, "cuda")
+    from edge_inference.serving import open_model
+
+    return open_model(*parse_variant(key, directory), threads=threads)
+
+
+def server_hardware(backend: str) -> dict[str, str]:
+    """What ran a server model: the processor always, the GPU when there is one."""
+    found = {"backend": backend, "machine": machine_model(), "cpu": cpu_model(),
+             "power_source": power_source()}  # fmt: skip
+    if backend == TORCH_CUDA:
+        from edge_inference.serving_torch import device_name
+
+        found["gpu"] = device_name("cuda")
+    return found
+
+
 def cmd_menu_serve(args: argparse.Namespace) -> int:
     """Answer photos with the menu's server models until interrupted."""
-    from edge_inference.serving import MenuServer, open_model
+    from edge_inference.serving import MenuServer
     from edge_inference.wire import serve as serve_requests
 
     directory = Path(args.dir)
     models = {
-        key: open_model(*parse_variant(key, directory), threads=args.threads) for key in args.models
+        key: open_server_model(key, directory, threads=args.threads, backend=args.backend)
+        for key in args.models
     }
     server = MenuServer(models, args.models[0])
     console.print(
-        f"Serving {', '.join(args.models)} on {args.host}:{args.port} at {args.threads} threads"
+        f"Serving {', '.join(args.models)} on {args.host}:{args.port} "
+        f"with {args.backend} at {args.threads} threads",
+        highlight=False,
     )
     try:
         serve_requests(server.handle, args.host, args.port)
@@ -564,17 +590,18 @@ def cmd_menu_profile_server(args: argparse.Namespace) -> int:
 
     from edge_inference.menu import timing_sample
     from edge_inference.preprocess import decode_photo
-    from edge_inference.serving import answer, open_model
+    from edge_inference.serving import answer
 
     payloads = Path(args.payloads)
     index = timing_sample(pd.read_csv(payloads.parent / f"{payloads.name}.csv"), args.images)
     directory, results = Path(args.dir), Path(args.results)
+    hardware = server_hardware(args.backend)
     for key in args.models:
-        served = open_model(*parse_variant(key, directory), threads=args.threads)
+        served = open_server_model(key, directory, threads=args.threads, backend=args.backend)
         cool_down(args.cool_to)
         warm = (payloads / f"{index['image'].iloc[0]}.jpg").read_bytes()
         for _ in range(args.warmup):
-            served.session.run(None, {"input": served.recipe(decode_photo(warm))})
+            served.infer(served.recipe(decode_photo(warm)))
         rows = []
         for row in index.itertuples():
             data = (payloads / f"{row.image}.jpg").read_bytes()
@@ -583,7 +610,7 @@ def cmd_menu_profile_server(args: argparse.Namespace) -> int:
             start = time.perf_counter()
             x = served.recipe(decode_photo(data))
             prepared = time.perf_counter()
-            logits = served.session.run(None, {"input": x})[0][0]
+            logits = served.infer(x)
             done = time.perf_counter()
             predicted, confidence = answer(logits)
             rows.append(
@@ -601,8 +628,7 @@ def cmd_menu_profile_server(args: argparse.Namespace) -> int:
                 }
             )
         frame = pd.DataFrame(rows).assign(
-            server=args.server, model=key, photo=payloads.name, threads=args.threads,
-            machine=machine_model(), cpu=cpu_model(), power_source=power_source(),
+            server=args.server, model=key, photo=payloads.name, threads=args.threads, **hardware
         )  # fmt: skip
         safe = key.replace("/", "_")
         out = results / f"menu_server_{args.server}_{safe}_{payloads.name}.csv.gz"
@@ -2276,6 +2302,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="variants as model@resolution/precision; the first is the default",
     )  # fmt: skip
     menu_serve.add_argument("--threads", type=int, default=6)
+    menu_serve.add_argument("--backend", default=ONNXRUNTIME, choices=[ONNXRUNTIME, TORCH_CUDA])
     menu_serve.add_argument("--host", default="0.0.0.0")
     menu_serve.add_argument("--port", type=int, default=8765)
     menu_serve.add_argument("--dir", default=str(MENU_DIR))
@@ -2296,6 +2323,9 @@ def build_parser() -> argparse.ArgumentParser:
     menu_profile_server.add_argument("--models", type=lambda s: s.split(","), required=True)
     menu_profile_server.add_argument("--server", required=True, help="a name for this server")
     menu_profile_server.add_argument("--threads", type=int, default=6)
+    menu_profile_server.add_argument(
+        "--backend", default=ONNXRUNTIME, choices=[ONNXRUNTIME, TORCH_CUDA]
+    )
     menu_profile_server.add_argument(
         "--images", type=int, default=1000, help="test photos to time; 0 for all"
     )

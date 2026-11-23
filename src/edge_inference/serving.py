@@ -28,10 +28,17 @@ def answer(logits: np.ndarray) -> tuple[int, float]:
 
 @dataclass
 class Served:
-    """One model the server can run."""
+    """One model the server can run, on ONNX Runtime's CPU provider.
+
+    `serving_torch` holds the same shape for PyTorch on a GPU: anything with
+    a `recipe` and an `infer` from a prepared batch of one to its logits.
+    """
 
     session: ort.InferenceSession
     recipe: Preprocess
+
+    def infer(self, x: np.ndarray) -> np.ndarray:
+        return self.session.run([OUTPUT_NAME], {INPUT_NAME: x})[0][0]
 
 
 def open_model(graph: Path, recipe: Path, *, threads: int) -> Served:
@@ -58,7 +65,7 @@ class MenuServer:
         start = self.clock()
         x = served.recipe(decode_photo(body))
         prepared = self.clock()
-        logits = served.session.run([OUTPUT_NAME], {INPUT_NAME: x})[0][0]
+        logits = served.infer(x)
         predicted, confidence = answer(logits)
         done = self.clock()
         return {
