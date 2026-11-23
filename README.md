@@ -1,8 +1,10 @@
 # Edge Inference
 
-Early exit and INT8 quantization for inference on edge devices. Measured on a
-CPU-only path with constrained cores, the deployment setting edge hardware
-imposes.
+A systematic measurement study of deep neural network deployment options for
+deadline-constrained edge inference: early exit, INT8, smaller inputs, a menu
+of models, servers on the local network and in the cloud, recorded links, and
+doing two things at once. Measured per image on the deployed path, then judged
+by a simulator, four yardsticks and live runs between machines.
 
 ---
 
@@ -33,6 +35,18 @@ imposes.
     - [Score decision rules on a changing network](#score-decision-rules-on-a-changing-network)
     - [Sweep device speeds and deadlines](#sweep-device-speeds-and-deadlines)
     - [Run it for real](#run-it-for-real)
+- [The model menu](#the-model-menu)
+    - [Fix the images once](#fix-the-images-once)
+    - [Export the menu](#export-the-menu)
+    - [Record what every variant answers](#record-what-every-variant-answers)
+    - [Profile the device, at full speed and slowed](#profile-the-device-at-full-speed-and-slowed)
+    - [Profile the servers](#profile-the-servers)
+    - [Record a link](#record-a-link)
+    - [Run plans live](#run-plans-live)
+    - [Score rules on a recorded link, and ask the advisor](#score-rules-on-a-recorded-link-and-ask-the-advisor)
+    - [Check the simulator against the live runs](#check-the-simulator-against-the-live-runs)
+    - [Measure the cloud tier unattended](#measure-the-cloud-tier-unattended)
+    - [Smaller inputs and hedging on the early-exit network](#smaller-inputs-and-hedging-on-the-early-exit-network)
 - [Training on a GPU machine](#training-on-a-gpu-machine)
     - [Getting a Colab runtime](#getting-a-colab-runtime)
     - [On the runtime](#on-the-runtime)
@@ -69,6 +83,17 @@ treats the network as a black box described by them. This repository produces
 quantization changes them, including whether quantization shifts _which_ exit a
 given image takes by perturbing the confidence scores the exit criterion
 depends on.
+
+A second study widens the question from "which option, when" to "which
+options are worth having". It measures seven pretrained ImageNet models at six
+input sizes in float32 and INT8 on ImageNetV2, a laptop slowed to two clock
+speeds with its energy, a second laptop and a cloud T4 as servers, and four
+recorded links, and carries plans out live between machines. The finding, in
+one line: choosing between options frame by frame is worth little and a table
+gets it; a smaller input in place of an early exit, and sending the photo while
+computing locally, are worth far more. The commands are under
+[The model menu](#the-model-menu), and every number is in
+[`results/RESULTS.md`](results/RESULTS.md).
 
 ---
 
@@ -140,9 +165,38 @@ edge-inference/
 │   ├── simulate.py         frames replayed under a changing network
 │   ├── split.py            what crosses the network at each split point
 │   ├── training.py         fine-tuning and evaluation, single or multi-exit
-│   └── yardsticks.py       what a rule could have scored, at four levels of knowledge
+│   ├── yardsticks.py       what a rule could have scored, at four levels of knowledge
+│   │
+│   │   the model menu:
+│   ├── advisor.py          what to deploy, read off a scoreboard
+│   ├── constants.py        names shared by measuring and deciding, no heavy imports
+│   ├── device.py           the device's side run for real: local, send, or both at once
+│   ├── energy.py           energy per inference from the processor's RAPL counters
+│   ├── intervals.py        paired intervals from a circular block bootstrap
+│   ├── live_check.py       live runs against the simulator, answers and times
+│   ├── manifest.py         which images a dataset holds and where each came from
+│   ├── menu.py             the menu's images, split, and what each variant answers
+│   ├── menu_table.py       the menu's measurements as one per-image table
+│   ├── ort_session.py      ONNX Runtime sessions without torch
+│   ├── preprocess.py       frame to input and frame to photo, without torch
+│   ├── probe.py            record a link over the project's own protocol
+│   ├── recorded.py         scoreboards on a recorded link
+│   ├── serving.py          the menu server: receive a photo, run a model, answer
+│   ├── serving_torch.py    the same models in PyTorch, for a GPU
+│   ├── signals.py          what a device can cheaply know about an image's difficulty
+│   ├── traces.py           recorded links, replayed by their clock
+│   ├── wire.py             messages and a connection that waits for several at once
+│   └── zoo.py              pretrained models, exported with their own input recipes
 ├── app/main.py             browser demo comparing float32 and INT8
-├── scripts/                record_network.py: how a real link behaves over time
+├── scripts/
+│   ├── record_network.py          how a link to a public endpoint behaves over time
+│   ├── device_config.sh           hold cores at a fixed clock, and put everything back
+│   ├── profile_device_session.sh  profile the device at three speeds, unattended
+│   ├── cloud_session.sh           measure the cloud tier on a Colab T4, unattended
+│   ├── cloud_vm.py                the steps that script runs on the VM
+│   └── idle_gap_check.py          the device idling between frames, against back to back
+├── docs/DESIGN.md          the design of the model-menu study
+├── manifests/              which images are for tuning, testing and calibration
 ├── tests/                  sanity checks
 ├── papers/                 citations and licenses for the reference papers
 ├── results/                committed CSVs and plots
@@ -710,6 +764,195 @@ To record how a real link behaves, for comparison with the assumed networks:
 python scripts/record_network.py --label my_link --out results/network_trace_my_link.csv
 ```
 
+## The model menu
+
+The commands above study one early-exit network. These study what a device
+could be offered instead: seven pretrained models at six input sizes in float32
+and INT8, a laptop slowed for real with its energy measured, a second machine
+and a cloud GPU as servers, links recorded rather than assumed, and plans
+carried out live between machines. Everything lands in the same kind of
+per-image table, and the same simulator, rules and yardsticks read it.
+
+The device side imports no torch, so it can run on any 64-bit board with
+ONNX Runtime and Pillow.
+
+### Fix the images once
+
+```bash
+mkdir -p data/imagenetv2
+curl -fsSL https://huggingface.co/datasets/vaishaal/ImageNetV2/resolve/main/imagenetv2-matched-frequency.tar.gz \
+    | tar -x -C data/imagenetv2      # named .tar.gz, but a plain tar inside
+uv run edge menu manifest
+```
+
+ImageNetV2 matched-frequency is 10,000 photographs collected after the models
+were trained, so none of them has seen it. The manifest
+(`manifests/imagenetv2_mf.csv`) fixes once which five images of each class are
+for tuning and which five for testing, and which tuning images calibrate INT8.
+Every choice is made on the tuning half; every result is on the test half.
+
+### Export the menu
+
+```bash
+uv run edge menu export --models resnet18,mnv3l,mnv4s,mnv4m \
+    --resolutions 224,192,160,128,112,96 --int8-recipe no-vnni
+uv run edge menu export --models resnet50,convnext_t --int8-recipe no-vnni-minmax
+uv run edge menu export --models convnextv2_b --calibration-images 0    # float32 only
+```
+
+Each model's input recipe is read from its weights' own metadata, never typed
+by hand. One ONNX graph per model and input size, since an exported graph fixes
+its height and width, plus an INT8 copy.
+
+> [!IMPORTANT]
+> The default static INT8 recipe collapsed the small MobileNets, by up to 25
+> points. On x86 without VNNI, ONNX Runtime's 8-bit kernels add products into a
+> saturating 16-bit sum, which 7-bit weights avoid; percentile ranges and keeping
+> the first and last layers in float fix the rest, on any processor.
+> `--int8-recipe no-vnni` does all three. The two larger models use min-max
+> ranges (`no-vnni-minmax`), because their percentile calibration does not fit
+> in 16 GB of memory.
+
+### Record what every variant answers
+
+```bash
+uv run edge menu answers --models resnet18,mnv3l,mnv4s,mnv4m --resolutions 224,192,160,128,112,96
+uv run edge menu payloads --photos jpeg256q85,jpeg160q85
+uv run edge menu photo-answers --models resnet50,convnext_t,convnextv2_b
+```
+
+What a model answers depends only on the image, so it is recorded once for
+every image: the device variants on the stored images, the server models on the
+photos a device would send (JPEG at quality 85, shorter side 256 or 160 px).
+Every photo is encoded once and its hash recorded, so a server elsewhere can
+check it has the same bytes.
+
+### Profile the device, at full speed and slowed
+
+```bash
+uv run edge menu profile-device --config laptop-asis-t2 --energy
+uv run edge menu profile-prepare --config laptop-asis-t2
+pkexec "$PWD/scripts/profile_device_session.sh"     # full speed, 2.0 GHz and 1.4 GHz, unattended
+```
+
+Graphs are timed on 1,000 test images; preparing each input and encoding each
+photo, which depend on the stored image's size, on all 10,000. `--energy` reads
+the processor's RAPL counters around batches of runs and subtracts idle power.
+
+The session script holds two cores at a fixed clock with
+`scripts/device_config.sh`, which records every setting it changes and puts each
+back afterwards; it also makes the energy counters readable and restores their
+permissions on exit. Below the processor's base clock the frequency driver must
+be in passive mode, which the script switches and switches back.
+
+### Profile the servers
+
+```bash
+uv run edge menu profile-server --payloads data/payloads/jpeg256q85 \
+    --models convnext_t@224/float32 --server edge-twin
+uv run edge menu scale-server --source edge-twin --name edge-windows \
+    --links direct-cable,phone-hotspot-5ghz,public-wifi-2.4ghz
+```
+
+A server is timed on the photos it would receive. `--backend torch-cuda` runs
+the models in PyTorch on a GPU with the same input recipe.
+
+The edge server here is a second laptop with the same processor; live, it
+answered 1.575 times as slowly as this one. `scale-server` measures that factor
+from the live runs and writes this laptop's timings scaled by it, with the
+factor in every row.
+
+### Record a link
+
+```bash
+uv run edge menu serve --models convnext_t@224/float32      # on the server
+uv run edge probe --server HOST:8765 --link my-link --label tune --seconds 600
+uv run edge probe --server HOST:8765 --link my-link --label test --seconds 600
+```
+
+Every 100 ms, the frame period, the probe sends a small echo for the round trip
+and a 32 kB echo for the uplink rate, over the same protocol frames use. Record
+each link twice: rules are tuned on one recording and scored on the other.
+
+On a congested link one exchange can outlast the tick, so the recording holds
+fewer rows than ticks. It is replayed by its clock: every tick of its time takes
+the exchange under way then, so a slow exchange counts for as long as it lasted.
+
+### Run plans live
+
+```bash
+uv run edge menu live --server HOST:8765 --variant mnv4m@160/float32 \
+    --server-model convnext_t@224/float32 --plans local,offload,hedge \
+    --cancel now --link my-link --label live
+```
+
+The device carries each plan out on real frames: it runs its graph, sends the
+photo on a worker thread, or does both at once and keeps whichever answer
+serves the frame by the deadline. Replies carry the request's id, so a late one
+never reaches the next frame.
+
+### Score rules on a recorded link, and ask the advisor
+
+```bash
+uv run edge menu scoreboard --config laptop-asis-t2 --link my-link \
+    --servers edge-windows --deadlines 50,100,200
+uv run edge menu advise --match "laptop-*" --name edge-windows
+```
+
+Every rule plays the test images over the test recording, tuned on the other
+half over the other recording. Each rule's gain over the best fixed option comes
+with a 95% interval from a circular block bootstrap over runs of 100 frames,
+since neighbouring frames meet nearly the same network. A link recorded once by
+`scripts/record_network.py` can stand in with `--recording`, halves to tune and
+to test.
+
+The advisor reads each scoreboard and says what to deploy: the simplest rule
+whose gain over the best fixed option has an interval wholly above zero, or the
+fixed option, with what it costs in device time and bytes; and, for an
+application that keeps a record, the rule with the best record share.
+
+### Check the simulator against the live runs
+
+```bash
+uv run edge menu check-live --config laptop-asis-t2 --links my-link \
+    --servers edge-windows --variants mnv4m@160/float32 \
+    --server-models convnext_t@224/float32 --photos jpeg256q85
+```
+
+This plays each live run's plans on the same images in the simulator, over many
+stretches of the link's recording, and compares both the answers given and the
+times. It is how the replay error on the congested link was found.
+
+### Measure the cloud tier unattended
+
+```bash
+DRY_RUN=1 TAILCAT=/path/to/tailcat scripts/cloud_session.sh    # rehearse on a free CPU VM
+TAILCAT=/path/to/tailcat scripts/cloud_session.sh              # the real run, on a T4
+```
+
+The script asks Colab for a T4 until one lands in the wanted region (Colab
+picks it; five tries at most), sends the code at the current commit, has the VM
+encode the test photos and check every hash, times the cloud models on the GPU,
+then serves them through [tailcat](https://github.com/tailscale/tailcat), which
+opens a direct encrypted path between two machines behind NAT without exposing a
+port. It records the link twice, runs plans live against it, and stops the
+session. Control goes through `colab exec`, never SSH. The rehearsal runs every
+step on a free VM without a GPU and keeps what it measures out of `results/`.
+
+### Smaller inputs and hedging on the early-exit network
+
+```bash
+uv run edge exits export --image-size 96
+uv run edge exits quantize --image-size 96
+uv run edge exits profile --precision int8 --image-size 96
+uv run edge decide evaluate --sizes 128,112,96 --hedge --cancel now
+```
+
+The first study's network can also run at smaller inputs, and its scoreboards
+can offer them as plans beside the exits. `--hedge` adds plans that send the
+photo and compute locally at once; `--cancel now` stops the local run the moment
+the server answers.
+
 ---
 
 ## Training on a GPU machine
@@ -1047,6 +1290,30 @@ network states are assumed. Two real Wi-Fi links recorded for comparison both
 behaved like the degraded one. These limits and the rest are in
 [`results/RESULTS.md`](results/RESULTS.md).
 
+### What each option was worth
+
+What each lever bought, in points of the share of frames answered correctly in
+time unless stated:
+
+| lever                 | gain                                                                                           | price and condition                                              |
+| --------------------- | ---------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| smaller input         | +33.5 over the best fixed option (56.7 to 90.2%), device 8x slower, 30 ms                      | none at run time; costs 24 to 31 points at 96 px on 1000 classes |
+| hedging               | up to +2.1 over the fair target; +4 to +6 against a cloud model; record 95.6 against 76.6%     | device time and bytes on every frame; a clearly stronger server  |
+| watching the network  | +17.1 with the original menu, +0.9 once smaller inputs are offered; +1.3 to +1.9 on edge links | a view of the network; pays only in a narrow band                |
+| INT8 recipe           | +2.0 to +25.4 over the default static recipe                                                   | calibration once                                                 |
+| stronger server model | +7.2 for a record kept within a second                                                         | nothing for an answer needed within 100 ms                       |
+
+- **A smaller input beats early exit:** the whole network at 96 px runs faster
+  than its first exit and is 31 points more accurate.
+- **A hedge is worth what the server knows beyond the device.** Against an edge
+  server barely stronger than the device it gained nothing; against a cloud
+  model seven points stronger, 4 to 6 points, with no view of the network.
+- **Live, the simulator matched every answer** on four links, and came within
+  1.6 points of every score on the good ones. Checking it exposed one replay
+  error, now fixed: a congested link's slow exchanges had been under-weighted.
+- **A device idling between frames runs 1.5 times slower** than its back-to-back
+  profile.
+
 ---
 
 ## Troubleshooting
@@ -1147,7 +1414,8 @@ OMP_NUM_THREADS=2 uv run edge bench --threads 2
 
 | Purpose                        | Library                             |
 | ------------------------------ | ----------------------------------- |
-| Model definitions and training | `torch`, `torchvision`              |
+| Model definitions and training | `torch`, `torchvision`, `timm`      |
+| Images on the device           | `pillow`, `numpy`                   |
 | Export and deployment runtime  | `onnx`, `onnxruntime`, `onnxscript` |
 | Results handling               | `pandas`                            |
 | Terminal output                | `rich`                              |
@@ -1155,6 +1423,7 @@ OMP_NUM_THREADS=2 uv run edge bench --threads 2
 | Tests                          | `pytest`                            |
 | Git hooks                      | `prek`                              |
 | Package management             | `uv`                                |
+| Cloud GPU and its link         | `colab` CLI, `tailcat`              |
 
 ---
 
