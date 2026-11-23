@@ -85,12 +85,13 @@ vm() {
     grep -q '^STEP OK' "$work/cloud-$stamp-$step.out"
 }
 
-echo "== code at $(git rev-parse --short HEAD)"
+code=$(git rev-parse --short HEAD)
+echo "== code at $code"
 if [[ -n $(git status --porcelain -- src pyproject.toml uv.lock scripts) ]]; then
     echo "uncommitted changes to the code: commit first, since the VM gets HEAD" >&2
     exit 1
 fi
-git archive --format=tar.gz -o "$work/code.tgz" HEAD -- \
+git archive --format=tar.gz -o "$work/code.tgz" "$code" -- \
     src pyproject.toml uv.lock .python-version manifests README.md
 
 region=""
@@ -157,7 +158,7 @@ cat >"$out/cloud_session_$link.json" <<EOF
   "tries": $try,
   "path": "$path",
   "gpu": "$(grep -m1 -A1 '^name, driver_version' "$work/cloud-$stamp-setup.out" | tail -1)",
-  "code": "$(git rev-parse --short HEAD)"
+  "code": "$code"
 }
 EOF
 echo "== done $(date +%T)"
