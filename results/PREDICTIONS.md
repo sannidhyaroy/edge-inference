@@ -92,9 +92,19 @@ Numbers are guesses with a range, not targets.
 
 10. ConvNeXt-Tiny on the T4 takes less than a third of its time on the second
     laptop's CPU at 6 threads.
+
+    **Held:** 9.2 ms per photo at the median on the T4 (decoding and preparing
+    3.3 ms, running 5.9 ms), against 54 ms on the second laptop, a sixth.
+    (`menu_server_cloud-t4_*`, `menu_server_edge-windows_*`)
 11. Median round trip: crowded 2.4 GHz Wi-Fi 5 to 30 ms with a 95th
     percentile above 100 ms; a 6 GHz phone hotspot under 10 ms; a direct
     cable under 1 ms; the remote GPU 150 to 300 ms.
+
+    **Mixed.** The remote GPU, in Oregon: 279 and 292 ms, held. The crowded
+    Wi-Fi: 95th percentile 228 to 358 ms, held, but a median of 44 to 49 ms as
+    frames meet it (21 ms per completed exchange), failed. The hotspot ran at
+    5 GHz, not 6, since the second laptop's Wi-Fi could not use 6 GHz: 10.2 to
+    10.5 ms, failed narrowly. The cable: 1.6 to 1.8 ms, failed. (`link_*.csv`)
 
 ## Deciding on recorded links
 
@@ -124,5 +134,19 @@ Numbers are guesses with a range, not targets.
     speed and 50 ms, 0.60 behind (interval -0.06 to 1.24).
 15. For record with H = 1000 ms, hedging with the remote GPU scores within one
     point of that server's own accuracy.
+
+    **Held.** The hedge with ConvNeXt V2-Base on the T4 records 73.88% on both
+    cloud links, at every device speed and deadline: the server's own accuracy
+    on the photos, since every answer arrives within the second. Live, on 200
+    frames over the link to Oregon, it recorded 75.0%, which the simulator
+    also expected for those images. (`menu_scoreboard_*_cloud-t4-oregon_*`,
+    `menu_live_check_laptop-asis-t2_cloud-t4.csv`)
 16. Live, the advisor's recommended plan scores within its paired interval of
     what the simulator predicted for the same recording.
+
+    **Not tested as stated.** The live runs carried three fixed plans (local,
+    send, hedge) chosen before the advisor existed, not the advisor's cascade.
+    For those plans the simulator matched every answer live and came within
+    1.6 points of every score on the cable and the hotspot; on the shared
+    Wi-Fi it overestimated sending (6.6% against 0.5%), since the live run met
+    a busier network than the recording. (`menu_live_check_*.csv`)
