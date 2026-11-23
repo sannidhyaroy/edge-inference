@@ -40,6 +40,7 @@ from edge_inference.traces import Bins, Trace, recorded_scenario
 from edge_inference.yardsticks import ladder_runs, score_run
 
 FAIR_TARGET = "3. best confidence rule per network"
+MIN_STATE_MS = 20_000.0
 
 
 @dataclass(frozen=True)
@@ -118,7 +119,9 @@ def run_recorded(
     setup: RecordedSetup,
 ) -> pd.DataFrame:
     """Tune, run and score every rule and yardstick; one row each."""
-    bins = Bins.fit(tuning_trace, reference_bytes(tuning), count=setup.bins)
+    # Each state needs at least 20 s of the tuning recording, whatever its tick.
+    min_ticks = max(1, round(MIN_STATE_MS / tuning_trace.tick_ms))
+    bins = Bins.fit(tuning_trace, reference_bytes(tuning), count=setup.bins, min_ticks=min_ticks)
 
     def scenario_for(table: Measurements, trace: Trace, seed: int) -> Scenario:
         return recorded_scenario(

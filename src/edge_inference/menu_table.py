@@ -144,3 +144,30 @@ def menu_measurements(
                 link=link,
             )
     return Measurements(order, labels, local, routes)
+
+
+def server_scale(timing: pd.DataFrame, live: pd.DataFrame) -> tuple[float, int]:
+    """How much slower a server ran live than `timing` says, and on how many photos.
+
+    `live` holds the frames of live runs that reached the server (`server_ms`
+    set), naming the model as `server_model`. The factor is the median, over
+    photos timed both ways, of the live time over the timed one: one number,
+    since the live runs used one model.
+    """
+    timed = timing.assign(timed_ms=timing["receive_ms"] + timing["compute_ms"])
+    sent = live[live["server_ms"].notna()].rename(columns={"server_model": "model"})
+    both = sent.merge(timed, on=["model", "photo", "image"])
+    if both.empty:
+        raise ValueError("no photo was both timed and sent live")
+    return float(np.median(both["server_ms"] / both["timed_ms"])), len(both)
+
+
+def scaled_server(timing: pd.DataFrame, factor: float, name: str) -> pd.DataFrame:
+    """`timing` as server `name`, every time multiplied by `factor`, provenance kept."""
+    return timing.assign(
+        receive_ms=timing["receive_ms"] * factor,
+        compute_ms=timing["compute_ms"] * factor,
+        server=name,
+        scaled_from=timing["server"],
+        scale=factor,
+    )

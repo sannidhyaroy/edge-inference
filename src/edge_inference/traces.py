@@ -58,6 +58,20 @@ class Trace:
             raise ValueError("the recording never measured an uplink rate")
         return cls(str(links[0]), rtt, rate.to_numpy(dtype=float), tick_ms)
 
+    @classmethod
+    def from_seconds(cls, rows: pd.DataFrame, link: str) -> Trace:
+        """A recording written by `scripts/record_network.py`: one row a second."""
+        rows = rows.rename(columns={"second": "tick"}).assign(link=link)
+        return cls.from_probe(rows, tick_ms=1000.0)
+
+    def halves(self) -> tuple[Trace, Trace]:
+        """The first half and the second, for a link recorded only once."""
+        middle = len(self) // 2
+        return tuple(
+            Trace(self.link, self.rtt_ms[part], self.uplink_mbps[part], self.tick_ms)
+            for part in (slice(None, middle), slice(middle, None))
+        )
+
     def frames(self, count: int, period_ms: float, start: int = 0) -> tuple[np.ndarray, np.ndarray]:
         """The round trip and rate each of `count` frames meets, one frame every `period_ms`.
 

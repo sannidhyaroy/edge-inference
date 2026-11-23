@@ -411,6 +411,30 @@ def cmd_menu_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_menu_scale_server(args: argparse.Namespace) -> int:
+    """Time a server by another's timings, scaled by how much slower it ran live."""
+    from edge_inference.menu_table import scaled_server, server_scale
+
+    results = Path(args.results)
+    files = sorted(results.glob(f"menu_server_{args.source}_*.csv.gz"))
+    if not files:
+        raise FileNotFoundError(f"no timings for server {args.source} in {results}")
+    timing = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
+    live = pd.concat(
+        [pd.read_csv(results / f"menu_live_{link}_{args.label}.csv.gz") for link in args.links],
+        ignore_index=True,
+    )
+    factor, count = server_scale(timing, live)
+    console.print(f"{args.name} ran {factor:.3f}x the time of {args.source} on {count} photos")
+    for (model, photo), frame in scaled_server(timing, factor, args.name).groupby(
+        ["model", "photo"]
+    ):
+        out = results / f"menu_server_{args.name}_{model.replace('/', '_')}_{photo}.csv.gz"
+        frame.to_csv(out, index=False)
+        console.print(f"Wrote [bold]{out}[/bold]")
+    return 0
+
+
 def cmd_menu_scoreboard(args: argparse.Namespace) -> int:
     """Score every rule and yardstick on one recorded link, for one device setup."""
     from edge_inference.menu import TEST, TUNE
@@ -448,10 +472,15 @@ def cmd_menu_scoreboard(args: argparse.Namespace) -> int:
     )
     split = manifest.set_index("image").loc[table.images, "split"].to_numpy()
     tuning, test = table.subset(split == TUNE), table.subset(split == TEST)
-    traces = {
-        label: Trace.from_probe(pd.read_csv(results / f"link_{args.link}_{label}.csv"))
-        for label in (args.tune_label, args.test_label)
-    }
+    if args.recording:
+        # A link recorded once: tune on its first half, test on its second.
+        halves = Trace.from_seconds(pd.read_csv(args.recording), args.link).halves()
+        traces = dict(zip((args.tune_label, args.test_label), halves, strict=True))
+    else:
+        traces = {
+            label: Trace.from_probe(pd.read_csv(results / f"link_{args.link}_{label}.csv"))
+            for label in (args.tune_label, args.test_label)
+        }
     console.print(
         f"{args.config} over {args.link}: {len(table.local)} device variants, "
         f"{len(table.routes)} photo routes, {len(tuning)} tuning and {len(test)} test images"
@@ -2340,6 +2369,19 @@ def build_parser() -> argparse.ArgumentParser:
     menu_live.add_argument("--dir", default=str(MENU_DIR))
     menu_live.set_defaults(func=cmd_menu_live)
 
+    menu_scale = menu_sub.add_parser(
+        "scale-server",
+        help="time a server by another's timings, scaled by how much slower it ran live",
+    )
+    menu_scale.add_argument("--source", required=True, help="the server whose timings to scale")
+    menu_scale.add_argument("--name", required=True, help="the server the live runs reached")
+    menu_scale.add_argument(
+        "--links", type=lambda s: s.split(","), required=True, help="links it was run live over"
+    )
+    menu_scale.add_argument("--label", default="live", help="the live runs' label")
+    menu_scale.add_argument("--results", default=str(RESULTS_DIR))
+    menu_scale.set_defaults(func=cmd_menu_scale_server)
+
     menu_scoreboard = menu_sub.add_parser(
         "scoreboard", help="score every rule on a recorded link for one device setup"
     )
@@ -2359,6 +2401,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     menu_scoreboard.add_argument(
         "--server-models", type=lambda s: s.split(","), default=[], help="all if empty"
+    )
+    menu_scoreboard.add_argument(
+        "--recording", default="", help="a link recorded once by scripts/record_network.py"
     )
     menu_scoreboard.add_argument("--tune-label", default="tune")
     menu_scoreboard.add_argument("--test-label", default="test")

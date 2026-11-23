@@ -2,7 +2,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from edge_inference.menu_table import donors, menu_measurements, route_key
+from edge_inference.menu_table import (
+    donors,
+    menu_measurements,
+    route_key,
+    scaled_server,
+    server_scale,
+)
 
 IMAGES = pd.DataFrame({"image": [0, 1, 2, 3], "label": [5, 6, 7, 8]})
 
@@ -68,3 +74,29 @@ def test_a_block_missing_an_image_or_holding_one_twice_is_refused():
     doubled = pd.concat([parts["payloads"]["jpeg8q50"]] * 2)
     with pytest.raises(ValueError, match="twice"):
         menu_measurements(**tables(payloads={"jpeg8q50": doubled}), link="wifi")
+
+
+def test_server_scale_is_the_median_ratio_on_photos_timed_both_ways():
+    timing = pd.DataFrame({
+        "server": "twin", "model": "big@16/int8", "photo": "jpeg8q50", "image": [1, 2, 3],
+        "receive_ms": [1.0, 1.0, 1.0], "compute_ms": [9.0, 19.0, 29.0],
+    })  # fmt: skip
+    live = pd.DataFrame({
+        "server_model": "big@16/int8", "photo": "jpeg8q50", "image": [1, 2, 3, 4, 1],
+        "server_ms": [15.0, 30.0, 45.0, 99.0, np.nan],
+    })  # fmt: skip
+    factor, count = server_scale(timing, live)
+    assert (factor, count) == (1.5, 3)
+
+    scaled = scaled_server(timing, factor, "edge")
+    assert scaled["compute_ms"].tolist() == [13.5, 28.5, 43.5]
+    assert scaled["receive_ms"].tolist() == [1.5] * 3
+    assert set(scaled["server"]) == {"edge"} and set(scaled["scaled_from"]) == {"twin"}
+
+
+def test_server_scale_refuses_runs_with_nothing_in_common():
+    timing = pd.DataFrame({"server": "twin", "model": "a@1/x", "photo": "p", "image": [1],
+                           "receive_ms": [1.0], "compute_ms": [1.0]})  # fmt: skip
+    live = pd.DataFrame({"server_model": "b@1/x", "photo": "p", "image": [1], "server_ms": [2.0]})
+    with pytest.raises(ValueError, match="no photo"):
+        server_scale(timing, live)

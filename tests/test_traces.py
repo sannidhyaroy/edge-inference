@@ -121,3 +121,17 @@ def test_rules_on_a_recording_see_the_measured_link_not_the_bin():
 
     simulate(Watcher(), scenario)
     assert seen == [1.0, 2.0, 3.0, 4.0]
+
+
+def test_a_once_a_second_recording_splits_into_halves():
+    rows = pd.DataFrame({
+        "second": [0, 1, 2, 3, 4], "label": "wifi", "rtt_ms": [5.0, 6.0, 7.0, np.nan, 9.0],
+        "uplink_mbps": [10.0, np.nan, np.nan, np.nan, 20.0],
+        "error": [None, None, None, "TimeoutError", None],
+    })  # fmt: skip
+    trace = Trace.from_seconds(rows, "public")
+    assert (trace.link, trace.tick_ms) == ("public", 1000.0)
+    first, second = trace.halves()
+    assert first.rtt_ms.tolist() == [5.0, 6.0]
+    assert second.rtt_ms.tolist() == [7.0, math.inf, 9.0]
+    assert second.uplink_mbps.tolist() == [10.0, 10.0, 20.0]
