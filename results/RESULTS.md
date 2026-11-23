@@ -72,7 +72,9 @@ to this setup and is reported as such.
 **What the menu is worth**
 
 - **A smaller input beats early exit:** the whole network at 96 px is faster
-  than the first exit and 31 points more accurate (section 20).
+  than the first exit and 31 points more accurate. Offered in the main
+  scenario, smaller inputs lift the best fixed option from 56.68% to 90.16%,
+  and leave choosing under a point to gain (section 20).
 - **INT8 needs the right recipe:** the default collapsed MobileNets by up to
   25 points on this processor; 7-bit weights, percentile ranges and float end
   layers bring every model within 0 to 8 points of float32 (section 21).
@@ -924,7 +926,13 @@ one sitting (`exit_profile_..._@{128,112,96}_*.csv.gz`, and `_recheck_` for
 | whole network at 96 px  |    2.18 |  87.69 |       4.16 |     89.86 |
 
 **At 96 px the whole network is faster than the first exit and 31 points more
-accurate.** Truncating the network keeps only coarse features; shrinking the
+accurate.** In the main scenario of section 13 (8x, 30 ms, T4, Wi-Fi and 4G),
+offering these inputs too (`decide evaluate --sizes 128,112,96 --hedge`,
+`decide_scoreboard_..._hedge_sizes128-112-96.csv`) raises the best fixed
+option from 56.68% to 90.16% (the INT8 network at 128 px), above the 73.75%
+that watching the network reached with the old menu. Watching it now adds
+0.87 points (lookup 91.03%), the fair target is 91.34%, and the hedge 92.94%.
+**Widening the menu was worth 33 points here; choosing, under one.** Truncating the network keeps only coarse features; shrinking the
 input keeps every layer on fewer pixels. The network was trained at 160 px
 with crops at many scales, which helps it at smaller inputs. On the 1000
 classes of section 21 the same shrink costs far more: 24 to 31 points from
