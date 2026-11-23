@@ -23,7 +23,10 @@ boost to 4547 MHz.
 ## In brief
 
 Sections 1 to 11 measure what each way of running the network costs. Sections
-12 to 17 use those measurements to decide between them. *Confirms* marks a
+12 to 17 use those measurements to decide between them, and section 18 adds
+hedging. Sections 20 to 27 widen the menu: smaller inputs, other models,
+INT8 done carefully, a slowed device with energy, a second machine as the
+edge server, a cloud GPU, four recorded links, and live runs. *Confirms* marks a
 result already known in general and measured here. Everything else is specific
 to this setup and is reported as such.
 
@@ -61,6 +64,31 @@ to this setup and is reported as such.
   scores 72.32% against 73.50% looked up (section 16).
 - **Two real Wi-Fi links to an internet server behaved like the assumed
   degraded network,** never like the good one (section 17).
+- **Hedging, sending the photo while the device works, needs no knowledge of
+  the network** and matches or beats the fair target where deciding pays, by
+  up to 2.1 points; for a record kept within a second it is far ahead (section
+  18).
+
+**What the menu is worth**
+
+- **A smaller input beats early exit:** the whole network at 96 px is faster
+  than the first exit and 31 points more accurate (section 20).
+- **INT8 needs the right recipe:** the default collapsed MobileNets by up to
+  25 points on this processor; 7-bit weights, percentile ranges and float end
+  layers bring every model within 0 to 8 points of float32 (section 21).
+- **The edge server on a photo barely beats the device's best model,** 67.1
+  against 66.7%; only a cloud-sized model is clearly stronger, 73.9% (section
+  21). The edge machine ran 1.6 times slower than its same-chip twin
+  (section 23).
+- **On recorded links, choosing gains about two points where the server can
+  answer in time, and nothing elsewhere** (section 25). Live, the simulator's
+  answers match exactly and its scores come within 1.6 points on the good
+  links (section 26).
+- **Against a cloud GPU with a clearly stronger model, hedging without
+  watching the network gains 4 to 6 points** where the deadline lets the
+  answer arrive, more than the informed lookup (section 27).
+- **A device idling between frames is about 1.5 times slower per frame**
+  than its back-to-back profile (section 26).
 
 Read "What these numbers are not" before quoting any of these.
 
@@ -831,6 +859,351 @@ been done.
 
 ---
 
+## 18. Hedging on the early-exit table
+
+The rules above choose one action per frame. A hedge does two at once: it
+sends the photo the moment the frame arrives and runs the device's model
+meanwhile, then takes the server's answer if it is in by the deadline and the
+device's otherwise. It needs no knowledge of the network. Two more scores
+judge a frame beyond acting once on it: `record` is the share of frames whose
+final answer, the server's if it arrives within a horizon of 1 s, is right;
+the ladder gains rung 3h, the best plan per network when hedges may be picked.
+
+Means over three seeds, 16 cells, T4 server, Wi-Fi and 4G half each
+(`decide_sweep_..._hedge.csv`), useful share in percent:
+
+| cell      | best fixed | lookup | fair target (3) | hedge | rung 3h |
+| --------- | ---------: | -----: | --------------: | ----: | ------: |
+| 4x, 20 ms |      78.42 |  84.19 |           84.22 | 86.34 |   86.42 |
+| 4x, 30 ms |      94.12 |  93.97 |           94.14 | 94.70 |   94.82 |
+| 8x, 30 ms |      57.12 |  74.23 |           74.24 | 75.41 |   75.43 |
+| 8x, 50 ms |      94.04 |  94.79 |           94.87 | 94.78 |   94.88 |
+
+- **Hedging without watching the network matches or beats the fair target
+  where deciding pays,** by up to 2.12 points, because it also rescues frames
+  on the good network whose server reply misses the deadline. In the other
+  cells it is at most 0.11 points below it on average.
+- **For a record it is far ahead:** 95.63% in every cell, against 76.63% for
+  the lookup in the band cells, since the server's answer almost always
+  arrives within a second.
+- **It costs device time:** busy 22.0 ms per frame at 8x and 30 ms, against
+  11.1 ms for the lookup. Stopping the local run the moment the server answers
+  recovers 46% of the difference at 8x with 20 and 30 ms, and 72% at 16x
+  (`..._hedge-cancel-now.csv`); stopping at the next exit recovers none there,
+  because the local plan is a single stage.
+
+---
+
+## 19. How much of Imagenette the backbone had seen
+
+3,791 of Imagenette's 3,925 validation images are ImageNet training images,
+and the backbone was pretrained on ImageNet; only 134 are ImageNet validation
+images (`accuracy_by_origin.csv`). Accuracy of the full float32 network:
+95.36% on the first group (interval 94.64 to 95.98), 97.76% on the second
+(93.62 to 99.24). The 134 unseen images do no worse, so there is no sign that
+the absolute accuracies are inflated; with 134 images the check cannot rule
+out a few points either way. Comparisons between rules use the same images
+and are unaffected. The model menu below uses ImageNetV2, which none of its
+models saw.
+
+---
+
+## 20. A smaller input beats early exit
+
+The early-exit network at smaller inputs, all 3,925 test images, two threads,
+one sitting (`exit_profile_..._@{128,112,96}_*.csv.gz`, and `_recheck_` for
+160 px):
+
+| what runs               | INT8 ms | INT8 % | float32 ms | float32 % |
+| ----------------------- | ------: | -----: | ---------: | --------: |
+| exit 1 at 160 px        |    2.81 |  56.79 |       4.73 |     62.11 |
+| exit 2 at 160 px        |    3.94 |  78.11 |       6.83 |     80.48 |
+| whole network at 160 px |    5.23 |  93.81 |       9.44 |     95.44 |
+| whole network at 128 px |    3.49 |  92.20 |       6.50 |     93.66 |
+| whole network at 112 px |    2.93 |  89.86 |       5.51 |     91.67 |
+| whole network at 96 px  |    2.18 |  87.69 |       4.16 |     89.86 |
+
+**At 96 px the whole network is faster than the first exit and 31 points more
+accurate.** Truncating the network keeps only coarse features; shrinking the
+input keeps every layer on fewer pixels. The network was trained at 160 px
+with crops at many scales, which helps it at smaller inputs. On the 1000
+classes of section 21 the same shrink costs far more: 24 to 31 points from
+224 to 96 px.
+
+---
+
+## 21. A menu of models on ImageNetV2
+
+Seven pretrained ImageNet classifiers, exported to ONNX at six input sizes
+(224 to 96 px) in float32 and INT8, scored on ImageNetV2 matched-frequency:
+10,000 images collected after the models were trained, split once into 5,000
+to tune on and 5,000 to test on (`manifests/imagenetv2_mf.csv`,
+`menu_answers_*.csv.gz`). Test half, 224 px, percent:
+
+| model                    | float32 | INT8, default recipe | INT8, `no-vnni` |
+| ------------------------ | ------: | -------------------: | --------------: |
+| ResNet-18                |   57.14 |                54.24 |           56.90 |
+| MobileNetV3-Large        |   61.18 |                37.32 |           58.16 |
+| MobileNetV4-small        |   59.98 |                35.34 |           52.22 |
+| MobileNetV4-medium       |   66.68 |                62.82 |           65.70 |
+| ResNet-50 (server)       |   69.68 |                58.42 |           69.10 |
+| ConvNeXt-Tiny (server)   |   70.54 |                66.84 |           69.20 |
+| ConvNeXt V2-Base (cloud) |   76.98 |                    - |               - |
+
+These are lower than Imagenette's because there are 1000 similar classes
+rather than 10 distinct ones, and ImageNetV2 is harder than ImageNet's own
+validation set by design.
+
+**The INT8 recipe matters as much as INT8 itself.** The default static recipe
+collapsed the small MobileNets. On 500 tune images, MobileNetV3-Large and
+MobileNetV4-small at 224 px:
+
+| setting                                       | MNv3-L | MNv4-s |
+| --------------------------------------------- | -----: | -----: |
+| float32                                       |   67.8 |   63.6 |
+| default                                       |   41.6 |   40.2 |
+| 7-bit weights (`reduce_range`)                |   52.2 |   47.6 |
+| percentile ranges                             |   55.2 |   50.4 |
+| 7-bit weights and percentile ranges           |   61.8 |   54.2 |
+| both, with the first and last layers in float |   64.0 |   54.8 |
+
+Several causes add up. On x86 without VNNI, ONNX Runtime's 8-bit kernels add
+pairs of products into a saturating 16-bit sum; 7-bit weights avoid the
+clipping. Percentile ranges and float end layers fix wide, outlier-heavy
+ranges, which depthwise layers, hard-swish and squeeze-and-excitation produce,
+and help on any processor. The last row is `--int8-recipe no-vnni`; ResNet-50
+and ConvNeXt-Tiny use it with minimum-to-maximum ranges, since their
+percentile calibration does not fit in memory. Every INT8 variant improved
+(by 2.02 to 25.36 test points, median 4.43) and no float32 answer changed.
+
+**No single small model wins.** On the tune half MobileNetV4-medium is the
+most accurate (68.02% at 224 px, 8.4 ms), but at equal accuracy MobileNetV3-
+Large can be faster (63.02% at 3.75 ms against MobileNetV4-medium's 63.04% at
+4.71 ms, 160 px). ResNet-18 is slower and less accurate than some MobileNet
+at every size. Every variant stays on the menu.
+
+**What a sent photo costs the server's accuracy.** The device sends a JPEG
+(quality 85) whose shorter side is 256 px (median 21.1 kB) or 160 px
+(9.7 kB). Float32, test half (`menu_photo_answers_*.csv.gz`):
+
+| server model     | stored image | 256 px photo | 160 px photo |
+| ---------------- | -----------: | -----------: | -----------: |
+| ConvNeXt V2-Base |        76.98 |        73.88 |        70.22 |
+| ConvNeXt-Tiny    |        70.54 |        67.06 |        61.10 |
+| ResNet-50        |        69.68 |        66.10 |        59.44 |
+
+**An edge server on a photo barely beats the device's best model** (67.06%
+against 66.68%). Only the cloud model is clearly stronger.
+
+---
+
+## 22. The device at three speeds, with energy
+
+The laptop as the device at two threads, at full speed, and with two cores
+held at 2.0 GHz and at 1.4 GHz (`scripts/device_config.sh`), on mains power.
+Every graph was timed on 1,000 test images, every preparation and photo
+encoding on all 10,000, and package energy per inference from RAPL with idle
+power subtracted (`menu_device_*`, `menu_prepare_*`, `menu_energy_*`):
+
+| MobileNetV4-medium, 224 px | full speed      | 2.0 GHz, 2 cores | 1.4 GHz, 2 cores |
+| -------------------------- | --------------- | ---------------- | ---------------- |
+| float32                    | 8.44 ms, 273 mJ | 16.81 ms, 98 mJ  | 23.52 ms, 119 mJ |
+| INT8                       | 5.28 ms, 177 mJ | 10.45 ms, 60 mJ  | 14.54 ms, 88 mJ  |
+
+- **Slower is close to uniformly slower:** the median ratio over 48 graphs is
+  1.96 at 2.0 GHz and 2.69 at 1.4 GHz; per model the ratios differ by under
+  9%, more within a model across input sizes (1.70 to 2.05 at 2.0 GHz).
+- **The most efficient clock is not the lowest.** 2.0 GHz uses the least
+  energy per inference; at 1.4 GHz the processor's standing power accumulates
+  over a longer run. The 1.4 GHz intervals are wide (INT8: 54 to 121 mJ).
+- **Holding a core below its 2.0 GHz base clock needed the driver in passive
+  mode.** In its default active mode the firmware ignored a 1.4 GHz limit.
+- Encoding the photo costs 1.37 ms at 256 px and 0.99 ms at 160 px at full
+  speed; preparing the device's input 1.7 to 2.3 ms.
+
+---
+
+## 23. Servers
+
+**On this laptop's processor (`edge-twin`), 1,000 photos at 256 px, median
+compute:** ResNet-50 INT8 11.4 ms, float32 17.9 ms; ConvNeXt-Tiny INT8 24.5
+ms, float32 31.6 ms; ConvNeXt V2-Base 125.6 ms. Decoding and preparing the
+photo adds 2 to 3 ms (`menu_server_edge-twin_*`).
+
+**The edge server, a second laptop with the same processor running Windows
+11 with 8 GB,** answered ConvNeXt-Tiny photos live in a median of 54 ms
+against the twin's 34 ms: 1.575 times as long, on each of three links, over
+1,174 photos timed both ways. The deployment environment, not only the chip,
+sets a server's speed. The edge server's timings for every model are the
+twin's scaled by that factor (`edge menu scale-server`,
+`menu_server_edge-windows_*`); one factor, measured on one model.
+
+---
+
+## 24. Three recorded links to the edge server
+
+`edge probe` records a link over the project's own protocol: every 100 ms a
+small echo (the round trip) and a 32 kB echo (the uplink rate), and every
+tenth tick a photo-sized one to check the two-parameter model. Each link was
+recorded twice for 10 minutes, one to tune on and one to test on
+(`link_*_{tune,test}.csv`):
+
+| link                                | round trip, median / p95 | photo-sized send, median | ticks completed |
+| ----------------------------------- | ------------------------ | -----------------------: | --------------: |
+| `direct-cable` (gigabit, no router) | 1.6 to 1.8 / 2.0 ms      |            0.5 to 1.0 ms |       all 6,001 |
+| `phone-hotspot-5ghz`                | 10.2 to 10.5 / 13.7 ms   |            8.5 to 8.9 ms |       all 6,001 |
+| `public-wifi-2.4ghz` (shared)       | 44 to 49 / 228 to 358 ms |              27 to 31 ms | 2,776 and 3,228 |
+
+On the shared Wi-Fi single exchanges often outlasted the tick, so the
+recording holds fewer rows than ticks. **A recording is replayed by its
+clock:** every tick of its time takes the exchange under way then, so a slow
+exchange counts for as long as it lasted. Its round trips above are weighted
+that way; counted per exchange, the median would be 21 ms. Replaying one row
+per tick at first gave the slow stretches half their weight; the live check
+of section 26 exposed it.
+
+---
+
+## 25. Deciding on recorded links
+
+Every rule plays the 5,000 test images over the test recording, tuned on the
+tune images over the tune recording, at one frame every 100 ms. Network
+states for the lookup are cut from the tune recording (three by the cost of
+sending the median photo, plus "down"). The lookup's family now includes
+cascades: answer on the device, and send the photo only when unsure. Every
+rule's gain over the best fixed option (picked with hindsight on the test
+frames, so the comparison can only understate a gain) has a 95% interval
+from a circular block bootstrap over runs of 100 frames, since neighbouring
+frames meet nearly the same network. Three device speeds, three links, three
+deadlines (`menu_scoreboard_laptop-*.csv`); the advice is
+`menu_advice_edge-windows.csv`.
+
+| link                 | 50 ms | 100 ms                                 | 200 ms                        |
+| -------------------- | ----- | -------------------------------------- | ----------------------------- |
+| `direct-cable`       | fixed | lookup, +1.26 to +1.62 points          | lookup, +1.70 to +1.82 points |
+| `phone-hotspot-5ghz` | fixed | lookup, +1.72 to +1.88 (2 of 3 speeds) | lookup, +1.82 to +1.84 points |
+| `public-wifi-2.4ghz` | fixed | fixed                                  | fixed                         |
+
+- **Where the server can answer in time, a cascade gains about two points,**
+  with intervals above zero: the device answers the frames it is sure of and
+  sends the rest to a server that is only slightly stronger.
+- **At 50 ms, and on the shared Wi-Fi, nothing beats the device's best
+  model,** MobileNetV4-medium at 224 px float32 (66.7%), at every device speed.
+- **The device's speed barely matters here:** even at 1.4 GHz its best model
+  takes 23.5 ms, inside every deadline. The deadlines that make adapting pay
+  for a slow device are those of section 13.
+- **Hedging without watching the network gains nothing on these links** (at
+  most +0.46 points, intervals including zero), unlike on the early-exit
+  table: there the server was far more accurate than the device's fallback;
+  here it is not.
+- **The lookup is within 0.5 points of the fair target in 25 of 27 settings.**
+- **For a record (1 s horizon), sending to the strongest model wins:** always
+  offloading to ConvNeXt V2-Base on the edge server records 73.9% on the cable
+  and the hotspot, against 66.7% for the device alone; 68.9 to 70.2% on the
+  shared Wi-Fi.
+
+---
+
+## 26. Hedging live, and the simulator checked against it
+
+Live runs against the edge server: the device at full speed running
+MobileNetV4-medium at 160 px float32, the server ConvNeXt-Tiny float32, 100 ms
+deadline, stopping the local run once the server answers, 200 frames per plan
+(`menu_live_*_live.csv.gz`). Useful share, percent:
+
+| link                    | local | send | hedge | server's answer, median arrival |
+| ----------------------- | ----: | ---: | ----: | ------------------------------: |
+| cable                   |  66.5 | 70.0 |  70.5 |                           58 ms |
+| hotspot                 |  66.5 | 70.0 |  70.5 |                           71 ms |
+| shared Wi-Fi            |  66.5 |  0.5 |  66.5 |                          355 ms |
+| shared Wi-Fi, as record |  66.5 | 66.0 |  70.5 |                                 |
+
+**The same plan is right on one link and useless on another, and the hedge
+needs no knowledge of which link it is on.**
+
+`edge menu check-live` plays each live run's plans in the simulator, on the
+same images, over 50 stretches of the link's test recording
+(`menu_live_check_laptop-asis-t2_edge-windows.csv`):
+
+- **Every answer given live is the one the table holds:** all 400 device
+  answers per link and every server answer, on all three links.
+- **On the cable and the hotspot the simulator is within 1.6 points of live**
+  and within 3.2 ms of the server's median arrival (57.4 against 58.0 ms,
+  67.4 against 70.6 ms).
+- **On the shared Wi-Fi it is within 0.4 points for the hedge** and for every
+  record share, but expects the server's answer at 231 ms against 355 ms
+  live: the live run met a busier network than the recording.
+- **The device ran slower live than in its profile:** 9.8 ms against 6.4 ms
+  (preparing 2.7 against 1.8 ms, inferring 7.0 against 4.7 ms). Live, the
+  device works one frame every 100 ms and idles between; the profile ran back
+  to back. Timed both ways on the same 400 images in alternating blocks
+  (`scripts/idle_gap_check.py`, `device_idle_gap_laptop-asis-t2.csv`), it
+  takes 10.24 ms with 90 ms of idling before each frame and 6.67 ms back to
+  back: **a device working at 10 frames a second is about 1.5 times slower
+  per frame than a back-to-back profile says.** Why (clocks winding down,
+  threads parking) is not separated here. At these deadlines it changes no
+  answer's timeliness; profiles for tighter ones should be taken at the frame
+  rate.
+
+---
+
+## 27. The cloud tier: a T4 over a long link
+
+ConvNeXt V2-Base and ConvNeXt-Tiny on a Tesla T4 in a Colab VM, in PyTorch
+with the same input recipe (`scripts/cloud_session.sh`, unattended; the
+session's facts in `cloud_session_cloud-t4-oregon.json`). Colab chooses the
+region; five attempts at one nearer the device gave South Carolina, Oregon,
+Nevada, Nevada and Oregon, so the link is `cloud-t4-oregon`. The VM encoded
+the test photos itself and every one matched the device's hash.
+
+- **On the GPU,** per photo at the median: V2-Base 16.2 ms to run (against
+  125.6 ms on the laptop's processor), ConvNeXt-Tiny 5.9 ms, plus 1.9 to
+  3.5 ms to decode and prepare (`menu_server_cloud-t4_*`). All 4,000 answers
+  are the ones the CPU gave.
+- **The link,** through tailcat on a direct path, recorded twice for 10
+  minutes over the phone hotspot: round trip 279 and 292 ms at the median
+  (p95 444 and 477 ms), uplink about 1.6 to 2.0 Mb/s, no errors
+  (`link_cloud-t4-oregon_*.csv`). A photo arrives about 420 ms after it is
+  sent.
+
+Rules against the T4 over that link, and over the older shared Wi-Fi
+recording of section 17 (a 56 ms round trip to an internet endpoint, halves
+to tune and test), which stands for a nearer region
+(`menu_scoreboard_laptop-*_{cloud-t4-oregon,internet-shared-wifi}_*.csv`,
+`menu_advice_*.csv`). Full-speed device below; at 2.0 and 1.4 GHz the hedge
+scores within 0.6 points of these, and the lookup up to 1.9 points lower,
+since its local plans take longer:
+
+| link                    | deadline | best fixed | lookup | hedge | fair target |
+| ----------------------- | -------: | ---------: | -----: | ----: | ----------: |
+| cloud, Oregon           |   100 ms |      66.68 |  66.68 | 66.68 |       66.68 |
+| cloud, Oregon           |   500 ms |      66.68 |  70.36 | 72.26 |       71.08 |
+| internet, shared Wi-Fi  |   100 ms |      66.68 |  68.06 | 70.84 |       68.88 |
+| internet, shared Wi-Fi  |   200 ms |      72.14 |  73.32 | 73.64 |       73.64 |
+| internet, shared Wi-Fi  |   500 ms |      73.88 |  74.08 | 73.88 |       74.30 |
+
+- **Against a clearly stronger server, hedging wins without watching the
+  network:** +5.6 points at 500 ms over Oregon and +3.8 to +4.2 at 100 ms
+  over the nearer link, with intervals above zero, above both the lookup and
+  the fair target. Against the edge server it gained nothing (section 25):
+  the hedge is worth what the server knows beyond the device.
+- **When the whole round trip fits easily, always sending is best** (73.88%
+  at 500 ms over the nearer link), and choosing adds nothing.
+- **At 100 and 200 ms over Oregon nothing reaches the server in time,** and
+  the device's own model is the answer.
+- **For a record, the hedge and always sending reach the server's own
+  73.9%** on both links, at every deadline.
+
+**Live over the link to Oregon** (200 frames per plan, 100 ms deadline): the
+device alone 66.5%; sending 0% in time, 73.5% as a record; the hedge 66.5% in
+time and 75.0% as a record. Every answer is the one the table holds, and the
+simulator expects the server's answer at 420 ms against 422 ms live, with
+record shares of 74.9 and 75.0% against 73.5 and 75.0%
+(`menu_live_cloud-t4-oregon_live.csv.gz`,
+`menu_live_check_laptop-asis-t2_cloud-t4.csv`).
+
+---
+
 ## What these numbers are not
 
 **The reference machine is a laptop, not an edge board.** It stands in for one,
@@ -838,16 +1211,21 @@ and constrained thread counts are the approximation. A real edge SoC has
 different cache sizes, memory bandwidth, and thermal behaviour, so this shows
 scaling behaviour rather than a prediction for any particular device.
 
-**A slower device is the laptop's times multiplied by a constant.** No slow
-device was measured. A real one is not uniformly slower: INT8 in particular
-gains more or less depending on the instructions the processor has.
+**A slower device is the laptop's times multiplied by a constant,** in
+sections 12 to 18. Sections 22 to 26 measure the laptop slowed for real: the
+same cores at lower clocks, close to uniformly slower (section 22), but still
+an x86 laptop, not an ARM board. A real edge processor gains more or less
+from INT8 depending on its instructions.
 
-**The networks are assumed, and the changing one has two states.** A round
-trip and an uplink speed, with no loss, no jitter and nothing in between. The
-two links recorded in section 17 both behaved like the degraded state.
+**The networks of sections 12 to 18 are assumed, and the changing one has
+two states.** Sections 24 to 26 replay recorded links instead, each tick as a
+round trip and an uplink rate: a model with two numbers, which the photo-sized
+probes check. Each link was recorded on one day, at one place.
 
-**Sending buys time here, never accuracy.** Both ends run the same network, so
-the server gives the answer the device would have. Imagenette is also easy:
+**In sections 1 to 18 sending buys time, never accuracy.** Both ends run the
+same network, so the server gives the answer the device would have. The menu
+of section 21 has stronger server models, but on a photo the edge's are only
+slightly stronger. Imagenette is also easy:
 the full model is wrong on 179 of 3925 images. Whether to send the hard images
 to a stronger model is a question this setup cannot ask.
 
@@ -856,7 +1234,9 @@ the other half of the same dataset, profiled on the same machine. The halves
 differ only in which images they hold. A deployed device would need its own
 profile.
 
-**The live run is one laptop with two emulations,** in one scenario. It checks
+**The live run of section 16 is one laptop with two emulations,** in one
+scenario. Section 26 runs between two machines over real links, 200 frames
+per plan: enough to check the simulator, not to rank close rules. It checks
 that the simulator's answers and typical times can be reproduced. It is not a
 measurement of a slow device or of a network.
 
@@ -875,8 +1255,13 @@ compared by accident.
 
 ---
 
+**The edge server's timings are a twin's, scaled.** One factor, measured live
+on one model, stands for every model on that machine (section 23).
+
+---
+
 ## Next
 
-A harder task with a stronger model on the server, so that sending can buy
-accuracy and not only time. A real slow device in place of a multiplier. And
-the recorded links replayed in place of the two-state network.
+A real ARM device in place of a slowed laptop. Profiles taken at the frame
+rate, and the cause of the slowdown between frames separated. Links recorded
+over days rather than minutes, and a cloud region nearer the device.
