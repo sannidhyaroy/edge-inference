@@ -16,11 +16,12 @@
 # channel. A failed run is logged and the next one still starts.
 set -uo pipefail
 
-# name:MHz:cores; an empty MHz leaves the processor as it is, unpinned.
+# name:MHz:cores:driver mode; an empty MHz leaves the processor as it is,
+# unpinned. Below the 2.0 GHz base clock the driver must be in passive mode.
 CONFIGS=(
-    "laptop-asis-t2::"
-    "laptop-2.0g-2c:2000:2,4"
-    "laptop-1.4g-2c:1400:2,4"
+    "laptop-asis-t2:::"
+    "laptop-2.0g-2c:2000:2,4:"
+    "laptop-1.4g-2c:1400:2,4:passive"
 )
 RAPL=(/sys/class/powercap/intel-rapl:0/energy_uj /sys/class/powercap/intel-rapl:0:0/energy_uj)
 
@@ -74,7 +75,7 @@ say "energy counters readable for this session"
 wanted=("$@")
 failed=()
 for entry in "${CONFIGS[@]}"; do
-    IFS=: read -r name mhz cpus <<<"$entry"
+    IFS=: read -r name mhz cpus mode <<<"$entry"
     if ((${#wanted[@]})) && [[ " ${wanted[*]} " != *" $name "* ]]; then
         continue
     fi
@@ -82,7 +83,7 @@ for entry in "${CONFIGS[@]}"; do
     "$here/device_config.sh" reset
     pin=()
     if [[ -n $mhz ]]; then
-        if ! "$here/device_config.sh" apply "$mhz" "$cpus"; then
+        if ! "$here/device_config.sh" apply "$mhz" "$cpus" "$mode"; then
             failed+=("$name: apply")
             continue
         fi
