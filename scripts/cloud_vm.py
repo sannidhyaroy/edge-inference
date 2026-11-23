@@ -42,7 +42,9 @@ SERVER = "cloud-t4"
 BACKEND = os.environ.get("BACKEND", "torch-cuda")
 IMAGES = int(os.environ.get("IMAGES", "1000"))
 PORT = 8765
-UV = Path.home() / ".local" / "bin" / "uv"
+# The installer is told where to put uv: its default differs between VMs.
+UV_HOME = CONTENT / "uv-bin"
+UV = UV_HOME / "uv"
 # `uv run` would otherwise sync the project back to its default extras and
 # remove the CUDA build of torch that setup installed.
 ENV = {**os.environ, "UV_NO_SYNC": "1", "PATH": f"{UV.parent}:{os.environ['PATH']}"}
@@ -87,7 +89,10 @@ def setup() -> None:
     ROOT.mkdir(exist_ok=True)
     run(f"tar -xzf {CONTENT / 'code.tgz'} -C {ROOT}")
     if not UV.exists():
-        run("curl -LsSf https://astral.sh/uv/install.sh | sh > /dev/null")
+        run(
+            f"curl -LsSf https://astral.sh/uv/install.sh "
+            f"| env UV_INSTALL_DIR={UV_HOME} UV_NO_MODIFY_PATH=1 sh > /dev/null"
+        )
     run(f"{UV} sync --extra cuda --no-dev --locked -q")
     if BACKEND == "torch-cuda":
         run("nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv")
