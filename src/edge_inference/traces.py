@@ -3,7 +3,14 @@
 `edge probe` records a link at the frame period: each tick, the round trip and
 the uplink rate. Here a recording becomes a `Trace`, and frame i meets the tick
 the recording was at when the frame arrived. A tick whose probe failed is a
-frame the server never answers. A tick whose large echo came back no slower
+frame the server never answers.
+
+On a congested link one exchange can outlast the tick, and the probe starts
+the next as soon as it can, so the recording holds fewer rows than ticks. It
+is therefore read by the clock, not by row: every tick of the recording's
+time takes the row whose exchange was under way then. A slow exchange so
+counts for as long as it lasted; counting rows instead would give the slow
+stretches of a link less weight than the time they took. A tick whose large echo came back no slower
 than the small one gives no rate, and keeps the last rate measured.
 
 Rules that look a plan up per network need a few network states, not a
@@ -45,7 +52,7 @@ class Trace:
 
     @classmethod
     def from_probe(cls, rows: pd.DataFrame, tick_ms: float = 100.0) -> Trace:
-        """A recording written by `edge probe`, one row per tick."""
+        """A recording written by `edge probe`, read on a grid of `tick_ms` by its clock `t_s`."""
         rows = rows.sort_values("tick")
         links = rows["link"].unique()
         if len(links) != 1:
@@ -56,7 +63,18 @@ class Trace:
         rate = rows["uplink_mbps"].where(rows["uplink_mbps"] > 0).ffill().bfill()
         if rate.isna().all():
             raise ValueError("the recording never measured an uplink rate")
-        return cls(str(links[0]), rtt, rate.to_numpy(dtype=float), tick_ms)
+        rate = rate.to_numpy(dtype=float)
+        if "t_s" in rows:
+            # Grid points sit mid-tick, so a probe that keeps time maps one row
+            # to one tick even when each starts a little after its tick.
+            started = rows["t_s"].to_numpy(dtype=float)
+            step = tick_ms / 1000.0
+            # (A tolerance, since 0.3 // 0.1 is 2 in floating point.)
+            ticks = int(np.floor(started[-1] / step + 1e-6)) + 1
+            grid = np.arange(ticks) * step + step / 2
+            under_way = np.clip(np.searchsorted(started, grid, side="right") - 1, 0, None)
+            rtt, rate = rtt[under_way], rate[under_way]
+        return cls(str(links[0]), rtt, rate, tick_ms)
 
     @classmethod
     def from_seconds(cls, rows: pd.DataFrame, link: str) -> Trace:

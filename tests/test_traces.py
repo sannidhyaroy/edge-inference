@@ -135,3 +135,18 @@ def test_a_once_a_second_recording_splits_into_halves():
     assert first.rtt_ms.tolist() == [5.0, 6.0]
     assert second.rtt_ms.tolist() == [7.0, math.inf, 9.0]
     assert second.uplink_mbps.tolist() == [10.0, 10.0, 20.0]
+
+
+def test_a_slow_exchange_counts_for_as_long_as_it_lasted():
+    # The second exchange took 0.5 s, so the probe skipped four ticks.
+    rows = pd.DataFrame({
+        "tick": [0, 1, 2, 3], "t_s": [0.001, 0.101, 0.601, 0.701], "link": "wifi",
+        "rtt_ms": [5.0, 400.0, 6.0, 7.0], "uplink_mbps": [10.0] * 4, "error": [None] * 4,
+    })  # fmt: skip
+    trace = Trace.from_probe(rows)
+    assert trace.rtt_ms.tolist() == [5.0, 400.0, 400.0, 400.0, 400.0, 400.0, 6.0, 7.0]
+
+
+def test_a_probe_that_keeps_time_gives_one_tick_per_row():
+    rows = probe_rows([5.0, 6.0, 7.0], [10.0, 10.0, 10.0]).assign(t_s=[0.0004, 0.1003, 0.2005])
+    assert Trace.from_probe(rows).rtt_ms.tolist() == [5.0, 6.0, 7.0]
