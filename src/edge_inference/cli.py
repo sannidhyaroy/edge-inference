@@ -465,12 +465,9 @@ def cmd_menu_scale_server(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_menu_scoreboard(args: argparse.Namespace) -> int:
-    """Score every rule and yardstick on one recorded link, for one device setup."""
-    from edge_inference.menu import TEST, TUNE
+def load_menu_table(args: argparse.Namespace, link: str):
+    """The measured table for `args.config` and `args.servers` over `link`, and its manifest."""
     from edge_inference.menu_table import menu_measurements
-    from edge_inference.recorded import RecordedSetup, run_recorded
-    from edge_inference.traces import Trace
 
     results = Path(args.results)
 
@@ -497,9 +494,47 @@ def cmd_menu_scoreboard(args: argparse.Namespace) -> int:
         stacked("menu_photo_answers_*.csv.gz"),
         servers,
         payloads,
-        link=args.link,
+        link=link,
         variants=args.variants or None,
     )
+    return table, manifest
+
+
+def cmd_menu_check_live(args: argparse.Namespace) -> int:
+    """Play each live run's plans in the simulator, on the same images, and compare."""
+    from edge_inference.live_check import simulate_live
+    from edge_inference.traces import Trace
+
+    results = Path(args.results)
+    found = []
+    for link in args.links:
+        live = pd.read_csv(results / f"menu_live_{link}_{args.label}.csv.gz")
+        table, _ = load_menu_table(args, link)
+        trace = Trace.from_probe(pd.read_csv(results / f"link_{link}_{args.test_label}.csv"))
+        found.append(
+            simulate_live(table, live, trace, args.servers[0], draws=args.draws).assign(
+                config=args.config
+            )
+        )
+    board = pd.concat(found, ignore_index=True)
+    out = results / f"menu_live_check_{args.config}_{args.servers[0]}.csv"
+    board.to_csv(out, index=False)
+    shown = ["link", "plan", "live_useful", "sim_useful", "live_record", "sim_record",
+             "live_median_ms", "sim_median_ms", "live_p95_ms", "sim_p95_ms",
+             "local_agree", "local_answers", "server_agree", "server_answers"]  # fmt: skip
+    console.print(board[shown].round(3).to_string(index=False))
+    console.print(f"Wrote [bold]{out}[/bold]")
+    return 0
+
+
+def cmd_menu_scoreboard(args: argparse.Namespace) -> int:
+    """Score every rule and yardstick on one recorded link, for one device setup."""
+    from edge_inference.menu import TEST, TUNE
+    from edge_inference.recorded import RecordedSetup, run_recorded
+    from edge_inference.traces import Trace
+
+    results = Path(args.results)
+    table, manifest = load_menu_table(args, args.link)
     split = manifest.set_index("image").loc[table.images, "split"].to_numpy()
     tuning, test = table.subset(split == TUNE), table.subset(split == TEST)
     if args.recording:
@@ -2413,6 +2448,27 @@ def build_parser() -> argparse.ArgumentParser:
     menu_scale.add_argument("--label", default="live", help="the live runs' label")
     menu_scale.add_argument("--results", default=str(RESULTS_DIR))
     menu_scale.set_defaults(func=cmd_menu_scale_server)
+
+    menu_check = menu_sub.add_parser(
+        "check-live", help="play live runs' plans in the simulator and compare"
+    )
+    menu_check.add_argument("--config", required=True, help="the device setup used live")
+    menu_check.add_argument("--links", type=lambda s: s.split(","), required=True)
+    menu_check.add_argument(
+        "--servers", type=lambda s: [s], required=True, help="the server reached live"
+    )
+    menu_check.add_argument(
+        "--photos", type=lambda s: s.split(","), default=["jpeg256q85", "jpeg160q85"]
+    )
+    menu_check.add_argument("--variants", type=lambda s: s.split(","), default=[])
+    menu_check.add_argument("--server-models", type=lambda s: s.split(","), default=[])
+    menu_check.add_argument("--label", default="live", help="the live runs' label")
+    menu_check.add_argument("--test-label", default="test", help="the recording to play")
+    menu_check.add_argument("--draws", type=int, default=50)
+    menu_check.add_argument("--manifest", default=str(MENU_MANIFEST))
+    menu_check.add_argument("--payloads", default=str(DATA_DIR / "payloads"))
+    menu_check.add_argument("--results", default=str(RESULTS_DIR))
+    menu_check.set_defaults(func=cmd_menu_check_live)
 
     menu_scoreboard = menu_sub.add_parser(
         "scoreboard", help="score every rule on a recorded link for one device setup"
