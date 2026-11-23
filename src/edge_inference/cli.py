@@ -248,7 +248,8 @@ def cmd_data_origin(args: argparse.Namespace) -> int:
 
 IMAGENETV2_ROOT = DATA_DIR / "imagenetv2" / "imagenetv2-matched-frequency-format-val"
 MENU_DIR = CHECKPOINT_DIR / "menu"
-ONNXRUNTIME, TORCH_CUDA = "onnxruntime", "torch-cuda"
+ONNXRUNTIME, TORCH_CUDA, TORCH_CPU = "onnxruntime", "torch-cuda", "torch-cpu"
+SERVER_BACKENDS = [ONNXRUNTIME, TORCH_CUDA, TORCH_CPU]
 MENU_MANIFEST = Path("manifests/imagenetv2_mf.csv")
 
 
@@ -393,11 +394,14 @@ def cmd_menu_photo_answers(args: argparse.Namespace) -> int:
 
 
 def open_server_model(key: str, directory: Path, *, threads: int, backend: str):
-    """A server model from its ONNX graph on the CPU, or from its weights in PyTorch on CUDA."""
-    if backend == TORCH_CUDA:
+    """A server model from its ONNX graph on the CPU, or from its weights in PyTorch.
+
+    PyTorch on the CPU is for rehearsing a GPU session on a machine without one.
+    """
+    if backend in (TORCH_CUDA, TORCH_CPU):
         from edge_inference.serving_torch import open_torch_model
 
-        return open_torch_model(key, "cuda")
+        return open_torch_model(key, backend.removeprefix("torch-"))
     from edge_inference.serving import open_model
 
     return open_model(*parse_variant(key, directory), threads=threads)
@@ -2302,7 +2306,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="variants as model@resolution/precision; the first is the default",
     )  # fmt: skip
     menu_serve.add_argument("--threads", type=int, default=6)
-    menu_serve.add_argument("--backend", default=ONNXRUNTIME, choices=[ONNXRUNTIME, TORCH_CUDA])
+    menu_serve.add_argument("--backend", default=ONNXRUNTIME, choices=SERVER_BACKENDS)
     menu_serve.add_argument("--host", default="0.0.0.0")
     menu_serve.add_argument("--port", type=int, default=8765)
     menu_serve.add_argument("--dir", default=str(MENU_DIR))
@@ -2323,9 +2327,7 @@ def build_parser() -> argparse.ArgumentParser:
     menu_profile_server.add_argument("--models", type=lambda s: s.split(","), required=True)
     menu_profile_server.add_argument("--server", required=True, help="a name for this server")
     menu_profile_server.add_argument("--threads", type=int, default=6)
-    menu_profile_server.add_argument(
-        "--backend", default=ONNXRUNTIME, choices=[ONNXRUNTIME, TORCH_CUDA]
-    )
+    menu_profile_server.add_argument("--backend", default=ONNXRUNTIME, choices=SERVER_BACKENDS)
     menu_profile_server.add_argument(
         "--images", type=int, default=1000, help="test photos to time; 0 for all"
     )
