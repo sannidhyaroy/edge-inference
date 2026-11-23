@@ -527,6 +527,24 @@ def cmd_menu_check_live(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_menu_advise(args: argparse.Namespace) -> int:
+    """The advice each scoreboard supports, one row per scoreboard."""
+    from edge_inference.advisor import advise
+
+    results = Path(args.results)
+    boards = sorted(results.glob(f"menu_scoreboard_{args.match}.csv"))
+    if not boards:
+        raise FileNotFoundError(f"no scoreboards match {args.match}")
+    advice = pd.DataFrame([advise(pd.read_csv(board)) for board in boards])
+    advice = advice.sort_values(["link", "config", "deadline_ms"])
+    advice.to_csv(results / f"menu_advice_{args.name}.csv", index=False)
+    shown = ["link", "config", "deadline_ms", "verdict", "rule", "useful", "fixed_useful",
+             "gain_lo", "gain_hi", "device_busy_ms", "sent_share", "record", "fixed_record"]  # fmt: skip
+    console.print(advice[shown].round(4).to_string(index=False))
+    console.print(f"Wrote [bold]{results / f'menu_advice_{args.name}.csv'}[/bold]")
+    return 0
+
+
 def cmd_menu_scoreboard(args: argparse.Namespace) -> int:
     """Score every rule and yardstick on one recorded link, for one device setup."""
     from edge_inference.menu import TEST, TUNE
@@ -2448,6 +2466,12 @@ def build_parser() -> argparse.ArgumentParser:
     menu_scale.add_argument("--label", default="live", help="the live runs' label")
     menu_scale.add_argument("--results", default=str(RESULTS_DIR))
     menu_scale.set_defaults(func=cmd_menu_scale_server)
+
+    menu_advise = menu_sub.add_parser("advise", help="the advice each scoreboard supports")
+    menu_advise.add_argument("--match", default="*", help="glob after menu_scoreboard_")
+    menu_advise.add_argument("--name", required=True, help="names the advice table")
+    menu_advise.add_argument("--results", default=str(RESULTS_DIR))
+    menu_advise.set_defaults(func=cmd_menu_advise)
 
     menu_check = menu_sub.add_parser(
         "check-live", help="play live runs' plans in the simulator and compare"
