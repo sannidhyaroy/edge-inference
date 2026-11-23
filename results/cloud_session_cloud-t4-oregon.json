@@ -1,0 +1,8 @@
+{
+  "link": "cloud-t4-oregon",
+  "region": "Oregon",
+  "tries": 5,
+  "path": "direct",
+  "gpu": "Tesla T4, 580.82.07, 15360 MiB",
+  "code": "d94b91a"
+}
