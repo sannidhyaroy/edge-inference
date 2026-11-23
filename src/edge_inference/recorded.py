@@ -15,6 +15,10 @@ The rules:
 * the lookup rule with hedged plans in its family.
 
 The yardsticks are those of `yardsticks`, with cascades in rungs 3 and 3h.
+
+Every rule's difference from the best fixed option, and its distance behind
+the fair target, come with 95% intervals from the frames both played
+(`intervals`), so a gap of a point can be told from noise.
 """
 
 from dataclasses import asdict, dataclass
@@ -24,6 +28,7 @@ import pandas as pd
 
 from edge_inference.config import SEED
 from edge_inference.decide import TIE_MARGIN
+from edge_inference.intervals import paired_interval
 from edge_inference.policies import Always, Lookup, plan_family
 from edge_inference.scoreboard import OURS, OURS_HEDGED, PROBE_INTERVALS, tuned_hedge
 from edge_inference.simulate import (
@@ -40,6 +45,7 @@ from edge_inference.traces import Bins, Trace, recorded_scenario
 from edge_inference.yardsticks import ladder_runs, score_run
 
 FAIR_TARGET = "3. best confidence rule per network"
+BEST_FIXED = "1. best fixed option"
 MIN_STATE_MS = 20_000.0
 
 
@@ -111,6 +117,25 @@ def _lookup(
     return rule
 
 
+EVENT_COLUMNS = ("total_ms", "correct", "local_correct", "server_at_ms", "server_correct")
+
+
+def _intervals(
+    frames: dict[str, tuple[np.ndarray, np.ndarray]], rule: str, seed: int
+) -> dict[str, float]:
+    """95% intervals for `rule` against the best fixed option and the fair target."""
+    useful, record = frames[rule]
+    fixed_useful, fixed_record = frames[BEST_FIXED]
+    found = {}
+    for name, difference in (
+        ("useful_vs_fixed", useful - fixed_useful),
+        ("record_vs_fixed", record - fixed_record),
+        ("behind_fair", frames[FAIR_TARGET][0] - useful),
+    ):
+        found[f"{name}_lo"], found[f"{name}_hi"] = paired_interval(difference, seed=seed)
+    return found
+
+
 def run_recorded(
     tuning: Measurements,
     test: Measurements,
@@ -132,6 +157,14 @@ def run_recorded(
     scenario = scenario_for(test, test_trace, setup.seed)
     tuning_scenario = scenario_for(tuning, tuning_trace, setup.seed + 1)
     rows = []
+    # Per rule, whether each frame was useful and whether its record was right.
+    frames: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+
+    def keep(name: str, total, correct, local_correct, server_at_ms, server_correct) -> None:
+        useful = np.asarray(correct, dtype=bool) & (np.asarray(total) <= setup.deadline_ms)
+        arrived = np.asarray(server_at_ms) <= setup.horizon_ms
+        record = np.where(arrived, server_correct, local_correct).astype(bool)
+        frames[name] = (useful.astype(float), record.astype(float))
 
     def plain(name: str, plan: Plan) -> None:
         outcome = scenario.resolve(plan)
@@ -142,6 +175,8 @@ def run_recorded(
             horizon_ms=setup.horizon_ms,
         )  # fmt: skip
         rows.append({"rule": name, "kind": "rule", "plans": plan.describe(), **scores})
+        keep(name, outcome.total_ms, outcome.correct, outcome.local_correct,
+             outcome.server_at_ms, outcome.server_correct)  # fmt: skip
 
     for variant in test.local:
         plain(f"always local {variant}", Plan(variant))
@@ -152,6 +187,7 @@ def run_recorded(
         trace = simulate(rule, scenario, setup.knowledge)
         scores = score_trace(trace, setup.deadline_ms, setup.horizon_ms)
         rows.append({"rule": rule.name, "kind": "rule", "plans": plans, **scores})
+        keep(rule.name, *(trace[c].to_numpy() for c in EVENT_COLUMNS))
 
     def chosen(rule: Lookup) -> str:
         text = "; ".join(
@@ -172,10 +208,14 @@ def run_recorded(
     for name, plans, run in ladder_runs(scenario, hedge=True, cascade=True):
         rows.append({"rule": name, "kind": "yardstick", "plans": plans,
                      **score_run(run, setup.deadline_ms, setup.horizon_ms)})  # fmt: skip
+        keep(name, *(run[c] for c in EVENT_COLUMNS))
 
     board = pd.DataFrame(rows)
     fair = board.loc[board["rule"] == FAIR_TARGET, "useful"].iloc[0]
     board["behind_fair"] = fair - board["useful"]
+    board = board.join(
+        pd.DataFrame([_intervals(frames, rule, setup.seed) for rule in board["rule"]])
+    )
     states = scenario.states
     return board.assign(
         **asdict(setup),
