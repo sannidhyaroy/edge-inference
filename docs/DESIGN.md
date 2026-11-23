@@ -1,8 +1,10 @@
 # Design
 
-The shape of the work from here on, written down before the code so that the
-code follows it. Each section says what is decided and why. Anything not here
-is either already built (see the README) or future work.
+The shape of the model-menu study, written down before the code so that the
+code would follow it, and brought up to date once it was built. Each section
+says what was decided and why; where the build differs from the plan, the
+section says so. The commands are in the README and every number is in
+`results/RESULTS.md`.
 
 ---
 
@@ -52,9 +54,9 @@ on measured costs, under all three kinds of application.
 | question | how good is choosing; what is early exit worth | which options are worth having |
 | data | Imagenette | ImageNetV2, matched frequency |
 | model | ResNet-18 with two early exits, the same model on device and server | pretrained classifiers without exits; a small one on the device, a larger one on the server |
-| device | a laptop, with a slower device modelled by a constant factor | a laptop slowed down for real, or a single-board computer |
-| servers | the laptop's CPU and a Tesla T4, profiled | a second computer on the local network, and a GPU over the internet |
-| network | two assumed states, switching as a Markov chain | links recorded with the project's own protocol |
+| device | a laptop, with a slower device modelled by a constant factor | the laptop at full speed and with two cores held at 2.0 and 1.4 GHz, with energy; no single-board computer was used |
+| servers | the laptop's CPU and a Tesla T4, profiled | a second laptop on the local network (same processor, Windows), and a Tesla T4 on Colab reached through tailcat |
+| network | two assumed states, switching as a Markov chain | four links recorded with the project's own protocol: a direct cable, a phone hotspot, a shared Wi-Fi network, and the internet to the T4; plus one older recording to a public endpoint |
 
 **Imagenette's provenance.** 3,791 of its 3,925 validation images are ImageNet
 training images, which the ImageNet-pretrained backbone has seen.
@@ -75,8 +77,8 @@ model has seen it.
 2. **The simulator is queue-free.** Each frame is resolved alone. The live
    runs that check the simulator are synchronous: a frame starts only after
    the previous reply has arrived or its horizon has passed. A separate run
-   at a fixed frame period, where work can overlap, is reported as a stress
-   result, not as a check.
+   at a fixed frame period, where work can overlap, was planned as a stress
+   result and was not run.
 3. **One manifest per dataset fixes tuning, test and calibration images.** A
    seed only changes the frame order and the network. Before this, each seed
    drew its own tuning half, so calibration images could leak into a test.
@@ -98,36 +100,40 @@ model has seen it.
 9. **Choices are made on tuning images only:** which small model, which
    resolutions, which JPEG quality.
 10. **Comparisons are paired.** Two rules are compared on the same frames
-    under the same network, with a bootstrap interval over frames. The margin
-    within which plans count as tied is a parameter.
+    under the same network. The 95% interval comes from a circular block
+    bootstrap over runs of 100 frames, ten seconds of a recording, since
+    neighbouring frames meet nearly the same network and resampling single
+    frames would make it too narrow. The margin within which plans count as
+    tied is a parameter.
 
 ---
 
 ## 5. The table
 
-One long table per device configuration, one row per image and local option
-and per image and route.
+The plan was one long table file per device configuration. As built, the
+table is assembled in memory (`menu_table`) from committed tables that each
+measure one thing:
 
-| column | local rows | route rows |
-| ------ | ---------- | ---------- |
-| `image`, `label`, `split` | yes | yes |
-| `kind` | `local` | `route` |
-| `variant` | `{model}@{resolution}/{precision}`, e.g. `mnv3l@160/int8`; the early-exit table keeps `float32` and `int8` | the variant a feature route continues from |
-| `exit`, `exit_name` | an index; a model without exits has only `0`, `final` | the exit a feature route follows |
-| `route`, `server`, `link` | | e.g. `jpeg224q85>edge/resnet50`, `edge/resnet50`, `lan-wifi` |
-| `device_config` | e.g. `laptop-asis-t2`, `laptop-1.4g-2c` | the same |
-| `device_ms`, `preprocess_ms` | to the exit, cumulative; resize and normalise | 0 |
-| `prepare_ms`, `payload_bytes` | 0 | encoding on the device; bytes sent |
-| `server_receive_ms`, `server_compute_ms` | 0 | measured on the server |
-| `predicted`, `confidence`, `correct` | the device's | the server's own |
+| table | what it holds |
+| ----- | ------------- |
+| `menu_answers_<model>` | every device variant's answer and confidence on every image |
+| `menu_photo_answers_<model>` | every server model's answer on every sent photo |
+| `menu_device_<config>` | each device variant's graph time on 1,000 test images |
+| `menu_prepare_<config>` | preparing each input and encoding each photo, on all 10,000 images |
+| `menu_server_<server>_<model>_<photo>` | the server's decode, preparation and run time, on 1,000 test photos |
+| `data/payloads/<photo>.csv` | every photo's size and hash |
+| `menu_energy_<config>` | joules per inference, with an interval and the idle power subtracted |
 
-The decoded frame is the camera's output and sits outside every timer. A local
-answer pays for preprocessing, a sent photo for resizing and encoding, the
-server for decoding and its own preprocessing.
+A graph's run time depends on the machine, not on what the image shows, so it
+is timed on a sample and every other image borrows the times of one timed
+image, its donor. The donor is the same for every variant and every server, so
+an image that met a slow moment on one option meets it on all of them.
 
-Energy is a separate table per device configuration: joules per inference for
-each variant and each encoding, with an interval, the idle power it was
-measured against, and the RAPL domain.
+Routes are named `photo>server/model@resolution/precision`, for example
+`jpeg256q85>edge-windows/convnext_t@224/float32`. The decoded frame is the
+camera's output and sits outside every timer: a local answer pays for
+preprocessing, a sent photo for resizing and encoding, the server for decoding
+and its own preprocessing.
 
 ---
 
@@ -145,12 +151,15 @@ measured against, and the RAPL domain.
   ready and whether it is right, when the server's arrives and whether it is
   right. Each kind of application reads its score from those events. For a
   hedged plan the device encodes, then sends and computes in parallel. With
-  cancellation the local run stops at the next stage boundary once the reply
-  is in.
+  cancellation the local run stops once the reply is in, at the next stage
+  boundary or at once.
 - **Recorded links** replace the Markov states with per-frame round trips and
-  uplink rates. For grouping, frames fall into at most three bins per link,
-  cut on quantiles of the tuning recording, so that the yardsticks that pick
-  a plan per group never get groups small enough to act as an answer key.
+  uplink rates. A recording is read by its clock: every tick of its time takes
+  the exchange under way then, so a slow exchange on a congested link counts
+  for as long as it lasted. For grouping, frames fall into at most three bins
+  per link, cut on quantiles of the tuning recording, plus a state for a link
+  that is down, so that the yardsticks that pick a plan per group never get
+  groups small enough to act as an answer key.
 
 ---
 
@@ -165,25 +174,28 @@ measured against, and the RAPL domain.
   the uplink rate, and every tenth tick a photo-sized echo to check that the
   two numbers predict a real send.
 - A server holds one or more models behind a header field, on ONNX Runtime
-  (CPU) or PyTorch (CUDA).
+  (CPU) or PyTorch (CUDA, or CPU to rehearse a GPU session).
+- `edge menu check-live` plays each live run's plans on the same images in the
+  simulator, over many stretches of the link's recording, and compares answers
+  and times.
 
 ---
 
 ## 8. The advisor
 
-`edge advise` takes a device's table, the servers' profiles, link recordings,
-a deadline, the kind of application and, optionally, prices on device time,
-bytes and energy. It reports:
+As built, `edge menu advise` reads the scoreboards on recorded links and
+writes one row of advice each. For an application that acts once it weighs,
+from simplest to most demanding, one fixed option, a hedge, the lookup rule,
+and the lookup rule with hedged plans. A candidate counts only if its paired
+interval over the best fixed option lies wholly above zero; the advice is the
+best that does, the simpler on a tie, or else the fixed option, with the
+device's busy time and the share of frames sent. For an application that keeps
+a record, it names the rule with the best record share.
 
-- every fixed option under the recorded link;
-- whether adapting is needed at all: the best fixed option against the lookup
-  rule and rungs 3 and 3h, with paired intervals; if they overlap, the advice
-  is to play the fixed option;
-- what hedging gains and what it costs, with and without cancellation;
-- with prices, the frontier between score and cost;
-- the plan for each link bin, in a file that `edge run` can load.
-
-Settings are chosen on the first recording and reported on a later one.
+Planned and not built: prices on device time, bytes and energy with the
+frontier between score and cost on recorded links (built only for the
+early-exit measurements), and a plan file per link bin that `edge run` could
+load.
 
 ---
 
@@ -199,7 +211,13 @@ Each row records the affinity, the policy of each pinned core and the measured
 average frequency. This is the same processor design, slower and narrower, and
 not a different kind of device. Comparing each variant's slowed time with its
 normal time tests the constant-factor assumption the early-exit measurements
-relied on.
+relied on: the median ratio over 48 graphs is 1.96 at 2.0 GHz and 2.69 at
+1.4 GHz, close to uniform.
+
+Below the processor's 2.0 GHz base clock the frequency driver must be in
+passive mode; in its default mode the firmware ignored a lower limit. Profiles
+are taken back to back, and a device idling 90 ms between frames ran about 1.5
+times slower per frame (`scripts/idle_gap_check.py`).
 
 ---
 
@@ -231,3 +249,7 @@ machine. Radio energy is not measured; bytes sent are reported instead.
     only.
 11. The energy reader survives counter wrap-around.
 12. The photos the server decodes are byte-identical to the device's.
+13. A paired interval has no width for a constant difference, and widens when
+    alike frames come in runs.
+14. A recording read by its clock gives a slow exchange the ticks it lasted,
+    and a probe that keeps time one tick per row.
